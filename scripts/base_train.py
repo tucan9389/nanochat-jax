@@ -523,7 +523,7 @@ def main() -> int:
         print(
             f"[info] process_index={process_idx} process_count={process_count} "
             f"local_device_count={local_device_count} "
-            f"jax.device_count={jax.device_count}"
+            f"jax.device_count={jax.device_count()}"
         )
         print(
             f"[info] depth={args.depth} aspect_ratio={args.aspect_ratio} head_dim={args.head_dim} "
@@ -575,7 +575,7 @@ def main() -> int:
     else:
         total_batch_size_tokens = (
             args.device_batch_size * args.seq_len
-            * max(jax.device_count, 1) * grad_accum_steps
+            * max(jax.device_count(), 1) * grad_accum_steps
         )
 
     # Karpathy muP scaling (PT base_train.py:287-315):
@@ -786,7 +786,7 @@ def main() -> int:
     if args.eval_every > 0:
         eval_steps_periodic = max(
             args.eval_tokens // (
-                args.device_batch_size * args.seq_len * max(jax.device_count, 1)
+                args.device_batch_size * args.seq_len * max(jax.device_count(), 1)
             ),
             1,
         )
@@ -853,7 +853,7 @@ def main() -> int:
             "loop_state": {
                 "min_val_bpb": min(losses) if losses else None,
                 "smooth_train_loss": float(np.mean(losses[-100:])) if losses else None,
-                "total_training_time": time.time - t0,
+                "total_training_time": time.time() - t0,
             },
         }
         save_checkpoint(
@@ -879,7 +879,7 @@ def main() -> int:
 
     for step in range(start_step, num_iter):
         # 7a. Batch + forward/backward (with gradient accumulation).
-        global_batch_size = args.device_batch_size * max(jax.device_count, 1)
+        global_batch_size = args.device_batch_size * max(jax.device_count(), 1)
 
         # 7b. Schedules (host-side Python floats → JAX scalars)
         lrm = jnp.float32(
@@ -974,7 +974,7 @@ def main() -> int:
 
         # 7f. Logging (master only, )
         if is_master and (step % args.log_every == 0 or step == num_iterations - 1):
-            elapsed = time.time - t0
+            elapsed = time.time() - t0
             print(
                 f"[step {step:4d}] loss={loss_val:.6f} "
                 f"lrm={float(lrm):.4f} mom={float(mom):.4f} wd={float(wd):.4f} "
@@ -1011,7 +1011,7 @@ def main() -> int:
         ):
             eval_t0 = time.time()
             val_bpb_periodic = _eval_val_bpb_now(step)
-            eval_elapsed = time.time - eval_t0
+            eval_elapsed = time.time() - eval_t0
             if is_master and val_bpb_periodic is not None:
                 print(
                     f"[step {step:4d}] val_bpb={val_bpb_periodic:.6f} "
@@ -1027,7 +1027,7 @@ def main() -> int:
                             "lrm": float(lrm),
                             "mom": float(mom),
                             "wd": float(wd),
-                            "elapsed": time.time - t0,
+                            "elapsed": time.time() - t0,
                         }) + "\n")
 
     # 8. Final weights save
@@ -1036,7 +1036,7 @@ def main() -> int:
         print(f"[info] Saved final weights to {args.weights_out}")
 
     if is_master and num_iter > 0:
-        elapsed = time.time - t0
+        elapsed = time.time() - t0
         print(
             f"[done] {num_iter} steps in {elapsed:.1f}s "
             f"(avg {elapsed / max(num_iter, 1):.3f}s/step)"
@@ -1062,7 +1062,7 @@ def main() -> int:
 
         eval_t0 = time.time()
         val_bpb = evaluate_bpb(model, val_loader, args.eval_steps, token_bytes)
-        eval_elapsed = time.time - eval_t0
+        eval_elapsed = time.time() - eval_t0
 
         if is_master:
             print(
@@ -1079,11 +1079,11 @@ def main() -> int:
                 "depth": args.depth,
                 "vocab_size": int(config.vocab_size),
                 "dtype": str(config.compute_dtype),
-                "process_count": int(jax.process_count),
-                "device_count": int(jax.device_count),
+                "process_count": int(jax.process_count()),
+                "device_count": int(jax.device_count()),
                 "use_real_data": bool(args.use_real_data),
                 "eval_only": bool(args.eval_only),
-                "wall_time_train_s": (time.time - t0 - eval_elapsed) if num_iter > 0 else 0.0,
+                "wall_time_train_s": (time.time() - t0 - eval_elapsed) if num_iter > 0 else 0.0,
                 "wall_time_eval_s": eval_elapsed,
                 "final_train_loss": losses[-1] if losses else None,
             }
@@ -1095,4 +1095,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main)
+    sys.exit(main())
