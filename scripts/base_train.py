@@ -233,7 +233,7 @@ def _rolling_delete_old_checkpoints(
         m = pattern.match(fname)
         if m:
             ckpts.append((int(m.group(1)), fname))
-    ckpts.sort
+    ckpts.sort()
     if len(ckpts) <= keep_last:
         return 0
     deleted = 0
@@ -505,7 +505,7 @@ def main() -> int:
     # all hosts to set up the cluster.
     if not args.no_distributed:
         try:
-            jax.distributed.initialize
+            jax.distributed.initialize()
         except RuntimeError as exc: # already-initialized or single-process
             print(
                 f"[warn] jax.distributed.initialize skipped: {exc}",
@@ -513,13 +513,13 @@ def main() -> int:
             )
 
     # 2. PT env-var bridge for dataloader
-    setup_distributed_env_vars
+    setup_distributed_env_vars()
 
     process_idx, process_count, local_device_count = get_process_info()
     is_master = process_idx == 0
 
     if is_master:
-        print(f"[info] jax.devices = {jax.devices}")
+        print(f"[info] jax.devices = {jax.devices()}")
         print(
             f"[info] process_index={process_idx} process_count={process_count} "
             f"local_device_count={local_device_count} "
@@ -633,8 +633,8 @@ def main() -> int:
         horizon_source = "explicit --num-iterations"
     elif args.target_param_data_ratio > 0:
         scaling_params = (
-            model.num_scaling_params["transformer_matrices"]
-            + model.num_scaling_params["lm_head"]
+            model.num_scaling_params()["transformer_matrices"]
+            + model.num_scaling_params()["lm_head"]
         )
         target_tokens = int(args.target_param_data_ratio * scaling_params)
         num_iterations = target_tokens // total_batch_size_tokens
@@ -656,7 +656,7 @@ def main() -> int:
         )
 
     # 5. Mesh + sharded train_step factory
-    mesh = make_mesh # default: jax.device_count
+    mesh = make_mesh() # default: jax.device_count
     # v4 (work 0036): register mesh for Splash multi-chip shard_map.
     # Must be set BEFORE jit-tracing the train_step so the mesh is captured
     # as a closed-over constant. ``set_splash_mesh(None)`` is a no-op for the
@@ -695,12 +695,12 @@ def main() -> int:
         token_bytes = jnp.asarray(token_bytes_np)
         if is_master:
             print(
-                f"[info] tokenizer vocab_size={tokenizer.get_vocab_size} "
+                f"[info] tokenizer vocab_size={tokenizer.get_vocab_size()} "
                 f"token_bytes.shape={token_bytes.shape} "
                 f"token_bytes.dtype={token_bytes.dtype}"
             )
-            assert tokenizer.get_vocab_size == config.vocab_size, (
-                f"Tokenizer vocab_size {tokenizer.get_vocab_size} != "
+            assert tokenizer.get_vocab_size() == config.vocab_size, (
+                f"Tokenizer vocab_size {tokenizer.get_vocab_size()} != "
                 f"model vocab_size {config.vocab_size}"
             )
 

@@ -255,7 +255,7 @@ def _inject_jax_pytree(model: GPT, pytree: dict[str, jax.Array]) -> None:
     Promotion to ``nanochat_jax/_inject.py`` is deferred to Phase 5/6 when
     checkpoint/inference paths share the same logic.
     """
-    for key, value in pytree.items:
+    for key, value in pytree.items():
         parts = key.split(".")
         target = model
         for p in parts[:-1]:
@@ -522,7 +522,7 @@ def _register_dataclass_pytree(cls: type, fields: tuple[str, ...]) -> None:
         return
 
     def _flatten(obj):
-        return tuple(getattr(obj, f) for f in fields),
+        return tuple(getattr(obj, f) for f in fields), ()
 
     def _unflatten(_, children):
         return cls(**dict(zip(fields, children, strict=True)))
