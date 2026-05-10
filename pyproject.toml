@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nanochat-jax"
+version = "0.1.0"
+description = "JAX/Flax NNX port of Andrej Karpathy's nanochat, optimized for multi-host Cloud TPU pods."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "jax~=0.10.0",
+    "jaxlib~=0.10.0",
+    "flax~=0.12.7",
+    "optax~=0.2.8",
+    "numpy~=2.4",
+    "tokenizers~=0.22",
+    "tiktoken~=0.11",
+    "rustbpe~=0.1",
+    "pyarrow>=17.0",
+    "requests~=2.33",
+    "jinja2~=3.1",
+    "pyyaml~=6.0",
+    "datasets~=4.8",
+]
+
+[project.optional-dependencies]
+tpu = [
+    "jax[tpu]~=0.10.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+    "torch~=2.11.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/tucan9389/nanochat-jax"
+Upstream = "https://github.com/karpathy/nanochat"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nanochat_jax"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "tpu: marks tests requiring real TPU hardware",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
