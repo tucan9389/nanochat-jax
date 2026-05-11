@@ -142,6 +142,45 @@ python -m scripts.chat_cli --prompt "Hello" -t 0   # single-prompt, greedy
 - After every session, `gcloud compute tpus tpu-vm delete ...` and sweep all
   candidate zones to confirm there are no leftover VMs.
 
+## Roadmap
+
+### Done
+
+- [x] Full pipeline: tokenizer → base pretrain → base eval → SFT → chat
+  CLI.
+- [x] d24 reference reproduced on a multi-host v5p-32 spot pod
+  (CORE 0.227, 88% of GPT-2 grade; see
+  [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md)).
+- [x] Multi-host data-parallel training with Muon ZeRO-2 momentum
+  sharding.
+- [x] Pallas Splash Attention path, numerically verified against xla
+  (`scripts/verify_splash.py`).
+- [x] 22-task DCLM CORE eval matching upstream's metric definition.
+
+### Not yet ported from upstream
+
+- [ ] RL fine-tuning (`chat_rl.py`); the chat pipeline here ends at SFT.
+- [ ] FP8 training (`fp8.py`); training is bf16 / fp32 only.
+- [ ] Web chat UI (`chat_web.py` + `ui.html`); only the CLI is shipped.
+
+### Closing the d24 gap to upstream
+
+The d24 result above (CORE 0.227, 88% of upstream's 0.2585) already
+includes the biggest single win, `--matmul-precision highest`.
+
+- [ ] Track down the remaining ~12% gap. Wider than upstream's ~6.4%
+  within-config variance, so it isn't pure noise. Untried: multi-seed
+  averaging, longer training horizons, the recipes from later
+  leaderboard rows.
+- [ ] Make Splash Attention compatible with `--matmul-precision=highest`
+  (MosaicError on jax 0.10; the d24 reference falls back to `xla`).
+- [ ] Fix multi-host resume from a non-zero step (today aborts; only
+  fresh restarts work).
+- [ ] Resolve the d24 CORE-eval OOM on a single v6e-1 host (workaround:
+  eval on v5p).
+- [ ] Add a `--no-final-eval` opt-out to `scripts/base_train.py`; the
+  last training step forces a validation pass that adds ~1 h on d24.
+
 ## Other JAX nanochat ports
 
 This is one of several JAX ports of nanochat in the wild. The ones that share
