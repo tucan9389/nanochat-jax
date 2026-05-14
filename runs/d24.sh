@@ -41,7 +41,7 @@ python -m scripts.base_train \
     --head-dim 128 \
     --target-param-data-ratio 12 \
     --total-batch-size 524288 \
-    --grad-accum-steps 2 \
+    --grad-accum-steps 4 \
     --device-batch-size 4 \
     --seq-len 2048 \
     --bf16 \
