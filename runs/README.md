@@ -4,8 +4,8 @@ Reproducible end-to-end pipelines.
 
 | Script | Purpose | Hardware | Typical wall | Cost (spot list-price) |
 |---|---|---|---|---|
-| `speedrun.sh` | Quick demo: tokenizer -> d12 base -> base eval -> tiny SFT | v6e-8 spot (8 chips, ~$8.7/hr) | ~30-60 min | **~$5-7** per full cycle |
-| `d24.sh` | Reference: full d24 base + CORE eval, mirrors Karpathy spec | v5p-32 spot (16 chips, ~$25.5/hr us-east5 / ~$20.5/hr europe-west4) | ~8h (train + eval) | **~$165-210** (europe-west4 ~20% cheaper than us-east5) |
+| `speedrun.sh` | Quick demo: tokenizer -> d12 base -> base eval -> tiny SFT | v6e-8 spot (8 chips, ~$8.7/hr) | ~30-60 min | **~$5-10** per full cycle |
+| `d24.sh` | Reference: full d24 base + CORE eval, mirrors Karpathy spec | v5p-32 spot (16 chips, ~$25.5/hr us-east5 / ~$20.5/hr europe-west4) | ~8h (train + eval) | **~$165-205** (europe-west4 ~20% cheaper than us-east5) |
 
 Spot pricing fluctuates by region and capacity. For d24, prefer `europe-west4-b` with a region-matched GCS bucket (`gs://...-eu-west4-*`).
 

@@ -9,7 +9,7 @@
 # (16 chips, 4 hosts × 4 chips) is the cheapest practical target; expect
 # ~6-7h train + ~1-1.5h eval (~8h VM lifetime).
 #
-# Cost (spot list-price): ~$165-210 per full run.
+# Cost (spot list-price): ~$165-205 per full run.
 #   us-east5     v5p-32 spot ~ $25.5/hr × ~8h ≈ ~$205
 #   europe-west4 v5p-32 spot ~ $20.5/hr × ~8h ≈ ~$165 (preferred — ~20% cheaper)
 # Spot pricing fluctuates by region and capacity.

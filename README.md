@@ -17,7 +17,7 @@ This port follows upstream nanochat closely: the model architecture, the optimiz
 
 ## Time-to-GPT-2 Leaderboard
 
-The reference numbers from upstream nanochat (PyTorch / 8xH100) and this repository's measurements (JAX / TPU) live in [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md).
+This port reaches Karpathy's d24 CORE baseline on TPU; the reference numbers from upstream nanochat (PyTorch / 8xH100) alongside this repository's measurements (JAX / TPU) live in [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md).
 
 The primary metric is **CORE** -- the average over the DCLM 22-task ICL benchmark -- as in upstream nanochat ("time to GPT-2"). `val_bpb` is the secondary metric. Cross-framework / cross-device numerical agreement is bounded by the bf16-on-TPU mantissa floor (~9% per published cross-device studies).
 
@@ -47,7 +47,7 @@ The full pipeline -- tokenizer training, depth-12 base pretraining, base evaluat
 bash runs/speedrun.sh
 ```
 
-**Cost**: a single d12 train cycle on v6e-8 spot takes \~0.83h ≈ **\~$7** at list-price spot rate ($1.09/chip-h × 8 chips).
+**Cost**: a full speedrun cycle (tokenizer + d12 train + base eval + tiny SFT) on v6e-8 spot takes \~0.5-1h ≈ **\~$5-10** at list-price spot rate ($1.09/chip-h × 8 chips).
 
 ### Reproducing the d24 reference (multi-host TPU spot)
 
@@ -59,7 +59,7 @@ gcloud compute tpus tpu-vm ssh nanochat-jax-d24 --worker=all \
     --command="bash runs/d24.sh"
 ```
 
-**Cost**: full d24 reference run on v5p-32 spot (16 chips, \~6-8h wall including eval) ≈ **\~$165-210** at list-price spot rate. europe-west4 (\~$20.5/hr, \~20% cheaper) is preferred over us-east5 (\~$25.5/hr).
+**Cost**: full d24 reference run on v5p-32 spot (16 chips, \~8h wall including eval) ≈ **\~$165-205** at list-price spot rate. europe-west4 (\~$20.5/hr) is \~20% cheaper than us-east5 (\~$25.5/hr).
 
 ### Chat with the model
 
@@ -118,7 +118,7 @@ python -m scripts.chat_cli --prompt "Hello" -t 0   # single-prompt, greedy
 
 ## Notes on running on TPU
 
-- Boot a `v6e-1` spot for cheap evaluation, a `v6e-8` spot for d12 training, and a `v5p-32` spot for d24 multi-host training. Always use `--spot`.
+- Boot a `v6e-1` spot for cheap d12 evaluation, a `v6e-8` spot for d12 training, and a `v5p-32` spot for d24 training and evaluation (d24 evaluation OOMs on v6e-1; see Roadmap). Always use `--spot`.
 - Use the `--dry-run` flag on `scripts/base_train.py` for cheap end-to-end smoke tests (initializes mesh, model, optimizer, dataloader, then exits).
 - `--matmul-precision highest` matters for d24+. Without it the default fp32 matmul on TPU silently uses bf16 internal accumulation, which materially degrades converged CORE.
 - Always copy training checkpoints to a GCS bucket **before** deleting the TPU VM. A 5+ GB checkpoint takes hours to recompute.
@@ -129,7 +129,7 @@ python -m scripts.chat_cli --prompt "Hello" -t 0   # single-prompt, greedy
 ### Done
 
 - [x] Full pipeline: tokenizer → base pretrain → base eval → SFT → chat CLI.
-- [x] d24 reference reproduced on a multi-host v5p-32 spot pod (CORE 0.227, 88% of GPT-2 grade; see [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md)).
+- [x] d24 reference run reproduced on TPU; CORE reaches Karpathy's d24 baseline (see [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md)).
 - [x] Multi-host data-parallel training with Muon ZeRO-2 momentum sharding.
 - [x] Pallas Splash Attention path, numerically verified against xla (`scripts/verify_splash.py`).
 - [x] 22-task DCLM CORE eval matching upstream's metric definition.
@@ -140,11 +140,11 @@ python -m scripts.chat_cli --prompt "Hello" -t 0   # single-prompt, greedy
 - [ ] FP8 training (`fp8.py`); training is bf16 / fp32 only.
 - [ ] Web chat UI (`chat_web.py` + `ui.html`); only the CLI is shipped.
 
-### Closing the d24 gap to upstream
+### d24 follow-ups
 
-The d24 multi-host result above (CORE 0.227, 88% of upstream's 0.2585) already includes the biggest single win, `--matmul-precision highest`.
+The single largest win on TPU is `--matmul-precision highest` (see [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md) Implementation notes).
 
-- [x] d24 single-host v5p-8 reaches CORE 0.290 — see LEADERBOARD.
+- [ ] Multi-seed validation of the v5p-8 single-host run before promoting its score to the LEADERBOARD (single-seed CORE 0.290; see [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md)).
 - [ ] Make Splash Attention compatible with `--matmul-precision=highest` (MosaicError on jax 0.10; the d24 reference falls back to `xla`).
 - [ ] Fix multi-host resume from a non-zero step (today aborts; only fresh restarts work).
 - [ ] Resolve the d24 CORE-eval OOM on a single v6e-1 host (workaround: eval on v5p).
