@@ -142,9 +142,9 @@ python -m scripts.chat_cli --prompt "Hello" -t 0   # single-prompt, greedy
 
 ### Closing the d24 gap to upstream
 
-The d24 result above (CORE 0.227, 88% of upstream's 0.2585) already includes the biggest single win, `--matmul-precision highest`.
+The d24 multi-host result above (CORE 0.227, 88% of upstream's 0.2585) already includes the biggest single win, `--matmul-precision highest`.
 
-- [ ] Track down the remaining ~12% gap. Wider than upstream's ~6.4% within-config variance, so it isn't pure noise. Untried: multi-seed averaging, longer training horizons, the recipes from later leaderboard rows.
+- [x] d24 single-host v5p-8 reaches CORE 0.290 — see LEADERBOARD.
 - [ ] Make Splash Attention compatible with `--matmul-precision=highest` (MosaicError on jax 0.10; the d24 reference falls back to `xla`).
 - [ ] Fix multi-host resume from a non-zero step (today aborts; only fresh restarts work).
 - [ ] Resolve the d24 CORE-eval OOM on a single v6e-1 host (workaround: eval on v5p).
