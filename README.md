@@ -47,7 +47,7 @@ The full pipeline -- tokenizer training, depth-12 base pretraining, base evaluat
 bash runs/speedrun.sh
 ```
 
-**Cost**: a single d12 train cycle on v6e-8 spot takes ~0.83h ≈ **~$7** at list-price spot rate ($1.09/chip-h × 8 chips).
+**Cost**: a single d12 train cycle on v6e-8 spot takes \~0.83h ≈ **\~$7** at list-price spot rate ($1.09/chip-h × 8 chips).
 
 ### Reproducing the d24 reference (multi-host TPU spot)
 
@@ -59,7 +59,7 @@ gcloud compute tpus tpu-vm ssh nanochat-jax-d24 --worker=all \
     --command="bash runs/d24.sh"
 ```
 
-**Cost**: full d24 reference run on v5p-32 spot (16 chips, ~6-8h wall including eval) ≈ **~$165-210** at list-price spot rate. europe-west4 (~$20.5/hr, ~20% cheaper) is preferred over us-east5 (~$25.5/hr).
+**Cost**: full d24 reference run on v5p-32 spot (16 chips, \~6-8h wall including eval) ≈ **\~$165-210** at list-price spot rate. europe-west4 (\~$20.5/hr, \~20% cheaper) is preferred over us-east5 (\~$25.5/hr).
 
 ### Chat with the model
 
