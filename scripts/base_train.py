@@ -482,6 +482,14 @@ def main() -> int:
         "80 * 524288 = 41,943,040. eval_steps = eval_tokens // (device_batch * seq_len * device_count).",
     )
     parser.add_argument(
+        "--no-final-eval", action="store_true",
+        help=" : suppress the forced final-step val_bpb eval that the "
+        "periodic-eval branch fires unconditionally on is_last_step. Periodic "
+        "evals at multiples of --eval-every continue to fire. No effect when "
+        "--eval-every=0. Saves ~5-40 min of duplicate eval when an external "
+        "base_eval.py pass runs after training (e.g. runs/d24.sh).",
+    )
+    parser.add_argument(
         "--token-bytes-path",
         type=str,
         default=None,
@@ -1005,10 +1013,16 @@ def main() -> int:
         # massive JIT compile (~50min for d24+B=8+Splash+multi-host) since the
         # eval graph is structurally different from the train graph. Skip eval
         # at step 0 — the first eval lands at step==eval_every.
+        # --no-final-eval suppresses the is_last_step branch only; if last step
+        # happens to align with the periodic schedule, that path still fires.
         val_bpb_periodic = None
-        if args.eval_every > 0 and (
-            is_last_step or (step > 0 and step % args.eval_every == 0)
-        ):
+        fire_periodic = (
+            args.eval_every > 0 and step > 0 and (step % args.eval_every == 0)
+        )
+        fire_final = (
+            args.eval_every > 0 and is_last_step and not args.no_final_eval
+        )
+        if fire_periodic or fire_final:
             eval_t0 = time.time()
             val_bpb_periodic = _eval_val_bpb_now(step)
             eval_elapsed = time.time() - eval_t0
