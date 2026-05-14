@@ -1,18 +1,12 @@
 # Leaderboard
 
-Reference numbers from this repository alongside upstream nanochat for
-comparison. The primary metric is **CORE** (DCLM 22-task ICL), as in upstream
-nanochat ("time to GPT-2"). `val_bpb` is the secondary metric.
+Reference numbers from this repository alongside upstream nanochat for comparison. The primary metric is **CORE** (DCLM 22-task ICL), as in upstream nanochat ("time to GPT-2"). `val_bpb` is the secondary metric.
 
-> Cross-framework / cross-device numerical agreement is bounded by the
-> bf16-on-TPU mantissa floor (~9% per published cross-device studies and ~6.4%
-> within Karpathy's own commit-to-commit variance). Numbers below should be
-> read with that floor in mind.
+> Cross-framework / cross-device numerical agreement is bounded by the bf16-on-TPU mantissa floor (~9% per published cross-device studies and ~6.4% within Karpathy's own commit-to-commit variance). Numbers below should be read with that floor in mind.
 
 ## Upstream nanochat (PyTorch + GPU, reference)
 
-Excerpted from
-[`karpathy/nanochat/dev/LEADERBOARD.md`](https://github.com/karpathy/nanochat/blob/master/dev/LEADERBOARD.md):
+Excerpted from [`karpathy/nanochat/dev/LEADERBOARD.md`](https://github.com/karpathy/nanochat/blob/master/dev/LEADERBOARD.md):
 
 | # | wall (h) | val_bpb | CORE | Description | Date | Commit |
 |---|---------|---------|--------|-------------|------|--------|
@@ -26,54 +20,24 @@ Excerpted from
 
 ## nanochat-jax (this repository, JAX + TPU)
 
-Two paired d24 runs, identical except for `--matmul-precision`. Both are full
-16,704-iteration trains on a multi-host v5p-32 spot pod mirroring Karpathy's
-Run 1 spec (batch 524,288, target-param-data-ratio 12, ClimbMix 170 shards,
-bf16, xla attention).
+Two paired d24 runs, identical except for `--matmul-precision`. Both are full 16,704-iteration trains on a multi-host v5p-32 spot pod mirroring Karpathy's Run 1 spec (batch 524,288, target-param-data-ratio 12, ClimbMix 170 shards, bf16, xla attention).
 
-| Date | Hardware | Model | Steps | val_bpb | CORE | Notes |
-|---|---|---|---|---|---|---|
-| 2026-05-04 | v5p-32 spot, ~6 h, ~$20 | d24, bf16, ClimbMix 170 shards, **default precision** | 16704 | 0.832 | 0.1774 (22-task) | Baseline: Karpathy d24 spec mirror, xla attention, no `--matmul-precision` flag. Tier 2 only; 31% CORE gap from the upstream d24 baseline 0.2585. Same config as the next row minus the precision flag. |
-| 2026-05-08 | v5p-32 spot, ~6 h, ~$32 | d24, bf16 + **`--matmul-precision highest`**, ClimbMix 170 shards | 16704 | 0.7596 | 0.227 (22-task) | One flag change vs the row above → **+27.6% CORE relative**. val_bpb enters Karpathy's same-config 6.4% variance band (`0.71854 +- 6.4%`); CORE reaches 88.5% of the GPT-2 threshold (0.2565). Without HIGHEST, JAX's default fp32 matmul on TPU silently uses bf16 internal accumulation, materially degrading converged CORE on d24+. |
+| Date | Hardware | Wall (h) | Cost (spot list-price) | Model | Steps | val_bpb | CORE | Notes |
+|---|---|---|---|---|---|---|---|---|
+| 2026-05-05 | v5p-32 us-east5 spot (16 chips, ~$25.5/hr) | ~8 (train + eval) | ~$205 | d24, bf16, ClimbMix 170 shards, **default precision** | 16704 | 0.832 | 0.1774 (22-task) | Baseline mirroring Karpathy d24 Run 1 spec; xla attention, no `--matmul-precision` flag. Tier 2 only; 31% CORE gap from upstream d24 baseline 0.2585. |
+| 2026-05-08 | v5p-32 spot (16 chips) | ~8 (train + eval) | ~$205 | d24, bf16 + **`--matmul-precision highest`**, ClimbMix 170 shards | 16704 | 0.7596 | **0.227** (22-task direct, single-seed) | One flag change vs the row above → **+27.6% CORE relative**. val_bpb enters Karpathy's same-config 6.4% variance band (0.71854 ± 6.4%); CORE reaches 88.5% of the GPT-2 threshold (0.2565). Without HIGHEST, JAX's default fp32 matmul on TPU silently uses bf16 internal accumulation, materially degrading converged CORE on d24+. **Single seed; Karpathy's 5-7 seed runs show std ~0.005-0.008. Multi-seed reproduction recommended before strong claims.** |
 
 ## Methodology
 
-- `val_bpb` is computed via `python -m scripts.base_eval --eval bpb`. The
-  validation split is the last shard of ClimbMix.
-- `CORE` is the DCLM 22-task ICL average, computed via
-  `python -m scripts.base_eval --eval core --max-per-task 100`.
-- "Spot" pricing is the price reported on the GCP console at the time of the
-  run; you may pay more or less depending on region and capacity.
+- `val_bpb` is computed via `python -m scripts.base_eval --eval bpb`. The validation split is the last shard of ClimbMix.
+- `CORE` is the DCLM 22-task ICL average, computed via `python -m scripts.base_eval --eval core --max-per-task 100`.
+- Cost is approximate, derived from list-price spot rates × wall time. Spot pricing fluctuates by region and capacity (europe-west4 spot is typically ~20% cheaper than us-east5).
 
 ## Implementation notes (TPU-specific)
 
-These are JAX/TPU surprises encountered while reproducing the d24 spec on a
-v5p-32 pod. They are not in the upstream nanochat repo because they only show
-up on TPU. None of them are bugs in the spec itself.
+These are JAX/TPU surprises encountered while reproducing the d24 spec on a v5p-32 pod. They are not in the upstream nanochat repo because they only show up on TPU. None of them are bugs in the spec itself.
 
-- **`--matmul-precision highest` is required for d24+.** This is the single
-  largest knob on TPU. JAX's default fp32 matmul on TPU silently uses bf16
-  internal accumulation for the matmul output, which materially degrades
-  converged CORE (paired runs above: 0.1774 → 0.227, +27.6%). The cost is a
-  modest sec/step slowdown (~5-10% on v5p in practice; the published "2.5×"
-  figure does not match what we measured on v5p MXUs). At d12 scale and short
-  trains the effect is in the noise; the regime where it matters is roughly
-  d24 + full 16,704-step trains.
-- **Splash Attention and `--matmul-precision=highest` are not jointly
-  supported in jax 0.10.** Splash is integrated (see `scripts/verify_splash.py`)
-  and slightly faster than xla on its own, but combining the two raises a
-  MosaicError. The d24 reference run uses `--attn-impl xla` so HIGHEST can
-  apply globally. Verified numerical agreement between xla and Splash is in
-  `scripts/verify_splash.py`.
-- **muP weight decay scaling.** Upstream nanochat scales
-  `weight_decay` by `sqrt(B/B_REF) * (D_REF/target_tokens)` (see Karpathy
-  `scripts/base_train.py` and `dev/LOG.md` 2026-01-10 entry). The JAX port
-  initially missed this; for d24 it means the configured `--weight-decay=0.28`
-  is automatically rescaled to ~0.042 (×0.151). The scaling is in place; we
-  measured it to be CORE-noise-neutral at d24 (within ±0.003) but kept it
-  because it matches upstream semantics and may matter at other depths.
-- **ClimbMix needs ≥150 shards.** Upstream `dev/LOG.md` 2026-03-04 entry says
-  ~150 shards (~7B tokens) is the minimum for d24 GPT-2 capability. We
-  initially tried 5 shards and got an 80-epoch overfit (val_bpb 1.00, CORE
-  0.13). The 2026-05-04 / 2026-05-08 runs above both use `python -m
-  nanochat_jax.dataset -n 170` for safety margin.
+- **`--matmul-precision highest` is required for d24+.** This is the single largest knob on TPU. JAX's default fp32 matmul on TPU silently uses bf16 internal accumulation for the matmul output, which materially degrades converged CORE (paired runs above: 0.1774 → 0.227, +27.6%). The cost is a modest sec/step slowdown (~5-10% on v5p in practice; the published "2.5×" figure does not match what we measured on v5p MXUs). At d12 scale and short trains the effect is in the noise; the regime where it matters is roughly d24 + full 16,704-step trains.
+- **Splash Attention and `--matmul-precision=highest` are not jointly supported in jax 0.10.** Splash is integrated (see `scripts/verify_splash.py`) and slightly faster than xla on its own, but combining the two raises a MosaicError. The d24 reference run uses `--attn-impl xla` so HIGHEST can apply globally. Verified numerical agreement between xla and Splash is in `scripts/verify_splash.py`.
+- **muP weight decay scaling.** Upstream nanochat scales `weight_decay` by `sqrt(B/B_REF) * (D_REF/target_tokens)` (see Karpathy `scripts/base_train.py` and `dev/LOG.md` 2026-01-10 entry). The JAX port initially missed this; for d24 it means the configured `--weight-decay=0.28` is automatically rescaled to ~0.042 (×0.151). The scaling is in place; we measured it to be CORE-noise-neutral at d24 (within ±0.003) but kept it because it matches upstream semantics and may matter at other depths.
+- **ClimbMix needs ≥150 shards.** Upstream `dev/LOG.md` 2026-03-04 entry says ~150 shards (~7B tokens) is the minimum for d24 GPT-2 capability. We initially tried 5 shards and got an 80-epoch overfit (val_bpb 1.00, CORE 0.13). The 2026-05-04 / 2026-05-08 runs above both use `python -m nanochat_jax.dataset -n 170` for safety margin.

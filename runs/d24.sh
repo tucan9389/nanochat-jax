@@ -6,17 +6,22 @@
 # leaderboard.
 #
 # Multi-host TPU is required for reasonable wall-clock. v5p-32 spot
-# (4 hosts x 4 chips) is the cheapest practical target; expect ~6h wall
-# and ~$30-50 (spot, region-dependent). Always launch on every worker
-# in parallel via ``--worker=all`` so ``jax.distributed.initialize``
-# can synchronize the coordinator.
+# (16 chips, 4 hosts × 4 chips) is the cheapest practical target; expect
+# ~6-7h train + ~1-1.5h eval (~8h VM lifetime).
+#
+# Cost (spot list-price): ~$165-210 per full run.
+#   us-east5     v5p-32 spot ~ $25.5/hr × ~8h ≈ ~$205
+#   europe-west4 v5p-32 spot ~ $20.5/hr × ~8h ≈ ~$165 (preferred — ~20% cheaper)
+# Spot pricing fluctuates by region and capacity.
+#
+# Always launch on every worker in parallel via ``--worker=all`` so
+# ``jax.distributed.initialize`` can synchronize the coordinator.
 #
 # CRITICAL: enable ``--matmul-precision highest`` for d24. Without it the
 # default fp32 matmul on TPU silently uses bf16 internal accumulation, which
 # significantly degrades the converged CORE.
 #
-# After the run, back up the checkpoint to GCS BEFORE deleting the TPU VM
-# (see docs/03-tpu-runbook.md / OPS_PLAYBOOK).
+# After the run, back up the checkpoint to GCS BEFORE deleting the TPU VM.
 
 set -euo pipefail
 

@@ -2,8 +2,11 @@
 # nanochat-jax speedrun: tokenizer + d12 base train + base eval + chat SFT.
 #
 # Designed for a single TPU host (v6e-8 spot is the cheapest practical target).
-# Total cost is roughly $1-3 depending on capacity and preemptions. Run this
-# from the project root after activating the venv with TPU support installed::
+# Cost (spot list-price): v6e-8 spot ~$8.7/hr × ~0.5-1h ≈ ~$5-10 per full
+# speedrun cycle (tokenizer train + d12 pretrain + base eval + tiny SFT).
+# Spot pricing fluctuates by region and capacity.
+# Run this from the project root after activating the venv with TPU support
+# installed::
 #
 #     pip install -e ".[tpu,dev]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 #
