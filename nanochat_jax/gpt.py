@@ -487,6 +487,41 @@ class GPT(nnx.Module):
         # Plain Python list -- not jax.Array, no NNX wrapping needed.
         self.window_sizes: list[tuple[int, int]] = _compute_window_sizes(cfg)
 
+    def estimate_flops_per_token(self) -> int:
+        """Estimated FLOPs per token (forward + backward).
+
+        Mirrors ``karpathy/nanochat::GPT.estimate_flops`` — excludes
+        embedding-class params (wte, value_embeds) and per-layer scalar
+        lambdas, since those don't contribute matmul FLOPs. Each remaining
+        matmul weight contributes 6 (2 fwd + 4 bwd). Attention adds
+        ``12 * h * q * effective_seq_len`` per layer (sliding-window aware).
+
+        Used by ``scripts/base_train.py`` to log MFU each step.
+        """
+        cfg = self.config
+        state = nnx.state(self, nnx.Param)
+        total = sum(int(p.size) for p in jax.tree.leaves(state))
+
+        excluded = int(self.transformer.wte.embedding.value.size)
+        for ve in self.value_embeds.values():
+            excluded += int(ve.embedding.value.size)
+        excluded += int(self.resid_lambdas.value.size)
+        excluded += int(self.x0_lambdas.value.size)
+        excluded += int(self.smear_gate.kernel.value.size)
+        excluded += int(self.smear_lambda.value.size)
+        excluded += int(self.backout_lambda.value.size)
+        matmul_params = total - excluded
+
+        h = cfg.n_head
+        q = cfg.n_embd // cfg.n_head
+        t = cfg.sequence_len
+        attn_flops = 0
+        for window_left, _window_right in self.window_sizes:
+            effective_seq = t if window_left < 0 else min(window_left, t)
+            attn_flops += 12 * h * q * effective_seq
+
+        return 6 * matmul_params + attn_flops
+
     def init_weights(
         self,
         *,

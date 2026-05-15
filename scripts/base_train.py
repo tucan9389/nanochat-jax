@@ -77,6 +77,7 @@ from nanochat_jax.common import setup_distributed_env_vars # noqa: E402
 from nanochat_jax.gpt import GPT, GPTConfig # noqa: E402
 from nanochat_jax.grad_utils import nnx_state_to_flat_dict # noqa: E402
 from nanochat_jax.loss_eval import evaluate_bpb # noqa: E402 —
+from nanochat_jax.perf import compute_mfu, get_peak_bf16_tflops # noqa: E402
 from nanochat_jax.sharding import get_process_info, make_mesh # noqa: E402
 
 
@@ -742,6 +743,19 @@ def main() -> int:
     if args.per_step_weights_out is not None and is_master:
         os.makedirs(args.per_step_weights_out, exist_ok=True)
 
+    # MFU bookkeeping (Karpathy nanochat parity).
+    num_flops_per_token = int(model.estimate_flops_per_token())
+    peak_tflops_per_chip = get_peak_bf16_tflops()
+    num_chips_total = max(jax.device_count(), 1)
+    tokens_per_step = args.device_batch_size * args.seq_len * num_chips_total * grad_accum_steps
+    if is_master:
+        device_kind = jax.devices()[0].device_kind if jax.devices() else "unknown"
+        print(
+            f"[info] flops/token = {num_flops_per_token:.3e}, "
+            f"peak BF16 = {peak_tflops_per_chip if peak_tflops_per_chip else '<unknown>'} TFLOPS/chip "
+            f"({device_kind}), tokens/step = {tokens_per_step:,}"
+        )
+
     # : resolve checkpoint_dir
     model_tag = args.model_tag or f"d{args.depth}_jax_seed{args.seed}"
     if args.checkpoint_dir is not None:
@@ -886,6 +900,7 @@ def main() -> int:
                 )
 
     for step in range(start_step, num_iter):
+        step_start_time = time.time()
         # 7a. Batch + forward/backward (with gradient accumulation).
         global_batch_size = args.device_batch_size * max(jax.device_count(), 1)
 
@@ -981,12 +996,24 @@ def main() -> int:
                 save_weights(model, step_path)
 
         # 7f. Logging (master only, )
+        step_dt = time.time() - step_start_time
         if is_master and (step % args.log_every == 0 or step == num_iterations - 1):
             elapsed = time.time() - t0
+            mfu_str = ""
+            # Skip step 0 (JIT compile dominates) — real MFU starts at step 1.
+            if step > 0 and peak_tflops_per_chip is not None:
+                mfu = compute_mfu(
+                    num_flops_per_token=num_flops_per_token,
+                    tokens_per_step=tokens_per_step,
+                    step_seconds=step_dt,
+                    peak_tflops_per_chip=peak_tflops_per_chip,
+                    num_chips=num_chips_total,
+                )
+                mfu_str = f" dt={step_dt*1000:.0f}ms mfu={mfu*100:.1f}%"
             print(
                 f"[step {step:4d}] loss={loss_val:.6f} "
                 f"lrm={float(lrm):.4f} mom={float(mom):.4f} wd={float(wd):.4f} "
-                f"elapsed={elapsed:.1f}s",
+                f"elapsed={elapsed:.1f}s{mfu_str}",
                 flush=True,
             )
 
