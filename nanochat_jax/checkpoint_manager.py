@@ -139,11 +139,12 @@ def load_checkpoint(
     step: int,
     *,
     load_optimizer: bool = False,
+    rank: int = 0,
 ) -> tuple[dict, dict | None, dict]:
     """Load ``(model_data, optimizer_data, meta_data)`` from a checkpoint directory.
 
     Reads ``model_<step:06d>.pt`` and ``meta_<step:06d>.json``; optionally also
-    reads ``optim_<step:06d>_rank0.pt`` (single-rank only). Tensors stay on CPU
+    reads ``optim_<step:06d>_rank<rank>.pt``. Tensors stay on CPU
     until JAX device placement happens downstream.
     """
     import torch
@@ -158,7 +159,7 @@ def load_checkpoint(
     optimizer_data = None
     if load_optimizer:
         optimizer_path = os.path.join(
-            checkpoint_dir, f"optim_{step:06d}_rank0.pt"
+            checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt"
         )
         if os.path.exists(optimizer_path):
             optimizer_data = torch.load(

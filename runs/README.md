@@ -1,18 +1,18 @@
 # runs/
 
-Reproducible end-to-end pipelines.
+Public reference run scripts.
 
-| Script | Purpose | Hardware | Typical wall | Cost (spot list-price) |
-|---|---|---|---|---|
-| `speedrun.sh` | Quick demo: tokenizer -> d12 base -> base eval -> tiny SFT | v6e-8 spot (8 chips, ~$8.7/hr) | ~30-60 min | **~$5-10** per full cycle |
-| `d24.sh` | Reference: full d24 base + CORE eval, mirrors Karpathy spec | v5p-32 spot (16 chips, ~$25.5/hr us-east5 / ~$20.5/hr europe-west4) | ~8h (train + eval) | **~$165-205** (europe-west4 ~20% cheaper than us-east5) |
+| Script | Purpose | Hardware |
+|---|---|---|
+| `speedrun.sh` | d24 base train -> BPB/CORE eval | v6e-8 TPU |
 
-Spot pricing fluctuates by region and capacity. For d24, prefer `europe-west4-b` with a region-matched GCS bucket (`gs://...-eu-west4-*`).
+`runs/speedrun.sh` is the only public entrypoint. Experiment commands and TPU smoke commands stay outside `runs/` until they are audited as public paths.
 
-## Operating notes
+Cost basis for the current result is the 2026-06-04 `us-central1` v6e-8 spot price snapshot: `$4.321096/hr`. Spot pricing and capacity change; recheck before budgeting.
 
-- Always launch multi-host runs on every worker in parallel (`gcloud compute tpus tpu-vm ssh ... --worker=all --command=...`) so `jax.distributed.initialize` can synchronize the coordinator.
-- Use `--spot` (preemptible) and check zone capacity before booting (`gcloud compute tpus tpu-vm list --zone=...`).
-- For d24 specifically, pass `--matmul-precision highest`. Without it the default fp32 matmul on TPU silently uses bf16 internal accumulation, which measurably degrades converged CORE.
-- After any d24 run, copy the checkpoint to GCS **before** deleting the TPU VM. Losing a 5+ GB checkpoint costs hours of training time.
-- Always `gcloud compute tpus tpu-vm delete ...` and sweep all candidate zones at the end of a session to confirm no zombie VMs.
+Operating notes:
+
+- `speedrun.sh` writes a base checkpoint under the nanochat-jax cache and reads the same `MODEL_TAG` in `scripts.base_eval`.
+- CORE uses `--max-per-task -1` by default. For a quick smoke run, set `CORE_MAX_PER_TASK=50`.
+- Copy expensive checkpoints to GCS before deleting a TPU VM.
+- Delete TPU VMs and sweep candidate zones after each session.

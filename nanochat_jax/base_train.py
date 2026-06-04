@@ -762,12 +762,107 @@ def make_grad_accum_fns(
     return _compute_grads, _accumulate_grads, _apply_update
 
 
+def make_fused_train_step(
+    mesh: jax.sharding.Mesh,
+    param_groups: list[dict],
+    optim_state: MuonAdamWState,
+    model: GPT,
+    *,
+    grad_accum_steps: int,
+    donate: bool = True,
+) -> tuple[Callable, "nnx.statelib.State"]:
+    """Build a fused grad-accum train step.
+
+    The returned function scans all micro-batches and runs the optimizer update
+    inside one ``jax.jit`` call. ``idx_all`` and ``targets_all`` have shape
+    ``(grad_accum_steps, B, T)``; axis 1 is data-sharded over ``mesh``.
+    """
+    if grad_accum_steps < 1:
+        raise ValueError("grad_accum_steps must be >= 1")
+
+    replicated = replicated_sharding(mesh)
+    micro_batch_sharding = data_parallel_sharding(mesh, batch_axis=1)
+    optim_state_spec = muon_state_sharding(mesh, optim_state)
+
+    graphdef, params_state, rest_state = nnx.split(model, nnx.Param, ...)
+    params_sharding = jax.tree.map(lambda _: replicated, params_state)
+
+    def _loss_of_params(ps, idx_, targets_):
+        m = nnx.merge(graphdef, ps, rest_state)
+        return m(idx_, targets=targets_)
+
+    def _fused_train_step(
+        params_state,
+        optim_state,
+        idx_all,
+        targets_all,
+        lr_mult,
+        muon_momentum,
+        muon_wd,
+    ):
+        def _micro(acc_grads_state, micro):
+            idx_, targets_ = micro
+            loss_i, grads_state = jax.value_and_grad(_loss_of_params)(
+                params_state,
+                idx_,
+                targets_,
+            )
+            return jax.tree.map(jnp.add, acc_grads_state, grads_state), loss_i
+
+        acc0 = jax.tree.map(jnp.zeros_like, params_state)
+        acc_grads_state, losses = jax.lax.scan(
+            _micro,
+            acc0,
+            (idx_all, targets_all),
+        )
+        loss = jnp.mean(losses)
+        inv_accum = jnp.float32(1.0 / grad_accum_steps)
+        acc_grads_state = jax.tree.map(lambda g: g * inv_accum, acc_grads_state)
+
+        params = nnx_state_to_flat_dict(params_state)
+        grads = nnx_state_to_flat_dict(acc_grads_state)
+        scaled_groups = _scale_param_groups(
+            param_groups,
+            lr_mult,
+            muon_momentum,
+            muon_wd,
+        )
+        new_params, new_optim_state = step_optim(
+            optim_state,
+            grads,
+            params,
+            scaled_groups,
+        )
+
+        m = nnx.merge(graphdef, params_state, rest_state)
+        _inject_jax_pytree(m, new_params)
+        _, new_params_state, _ = nnx.split(m, nnx.Param, ...)
+        return new_params_state, new_optim_state, loss
+
+    fused = jax.jit(
+        _fused_train_step,
+        in_shardings=(
+            params_sharding,
+            optim_state_spec,
+            micro_batch_sharding,
+            micro_batch_sharding,
+            replicated,
+            replicated,
+            replicated,
+        ),
+        out_shardings=(params_sharding, optim_state_spec, replicated),
+        donate_argnums=(0, 1) if donate else (),
+    )
+    return fused, params_state
+
+
 __all__ = [
     "TrainState",
     "get_lr_multiplier",
     "get_muon_momentum",
     "get_weight_decay",
     "init_train_state",
+    "make_fused_train_step",
     "make_grad_accum_fns",
     "make_train_step_sharded",
     "train_loop",

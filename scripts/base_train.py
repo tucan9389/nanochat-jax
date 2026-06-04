@@ -1,52 +1,19 @@
-"""Train a base model on multiple TPU hosts (data-parallel).
+"""Train a nanochat-style base model on TPU or CPU.
 
-Composes the JAX-native sharding primitives in :mod:`nanochat_jax.sharding`,
-the optimizer in :mod:`nanochat_jax.optim`, and the training loop helpers in
-:mod:`nanochat_jax.base_train` into a self-contained training entry point.
-The validation BPB pass uses :func:`nanochat_jax.loss_eval.evaluate_bpb`
-(multi-host aware via ``jax.experimental.multihost_utils``).
-
-Out of scope (Phase 6+ follow-up):
-
-- gradient accumulation (default ``grad_accum_steps=1``)
-- checkpoint save / resume
-- wandb logging (master ``jax.process_index == 0`` print only)
-- mixed precision (FP8 GradScaler) — bf16/fp32 only
-- CORE metric
-
-Composes:
-
-- :func:`jax.distributed.initialize` — multi-host coordinator (auto-detect)
-- :func:`nanochat_jax.common.setup_distributed_env_vars` — JAX semantic → PT
-  env-var bridge so dataloader can read rank info
-- :func:`nanochat_jax.sharding.make_mesh` — 1D ``("data",)`` mesh over
-  ``jax.device_count``
-- :func:`nanochat_jax.base_train.init_train_state` — model + param_groups +
-  zero-init optim_state
-- :func:`nanochat_jax.base_train.make_train_step_sharded` — +
-  factory (closure capture mesh + param_groups + optim_state)
-- 100-step Python loop with host-side schedules
-- NaN guard + training divergence check
-- Per-step weights save for M6 metric (single-host vs multi-host comparison)
-
-References:
-
-- PT mirror: ``nanochat/scripts/base_train.py:507-540``
+This entry point keeps the public training contract close to upstream
+``nanochat/scripts/base_train.py`` while adding JAX/TPU-specific execution
+controls for sharding, checkpointing, gradient accumulation, Splash Attention,
+and precision.
 
 Usage::
 
-    # CPU dry run (Phase 0)
+    # CPU dry run
     python scripts/base_train.py --depth=2 --num-iterations=2 \\
         --device-batch-size=2 --seq-len=128 --no-distributed
 
-    # single-host TPU v6e-2/4 (Phase 1/2 sanity)
+    # Single-host TPU smoke
     python scripts/base_train.py --depth=12 --num-iterations=100 \\
-        --device-batch-size=4 --weights-out=weights_v6e2.npz
-
-    # multi-host TPU v6e-8 (Phase 3 M6 trigger, run on all workers)
-    gcloud compute tpus tpu-vm ssh ... --worker=all --command="\\
-        python scripts/base_train.py --depth=12 --num-iterations=100 \\
-            --device-batch-size=4 --weights-out=weights_v6e8.npz"
+        --device-batch-size=4 --use-real-data --model-tag=d12_smoke
 """
 
 import argparse
@@ -70,10 +37,11 @@ from nanochat_jax.base_train import ( # noqa: E402 — sys.path mutation above
     get_muon_momentum,
     get_weight_decay,
     init_train_state,
+    make_fused_train_step,
     make_grad_accum_fns,
     make_train_step_sharded,
 )
-from nanochat_jax.common import setup_distributed_env_vars # noqa: E402
+from nanochat_jax.common import get_base_dir, setup_distributed_env_vars # noqa: E402
 from nanochat_jax.gpt import GPT, GPTConfig # noqa: E402
 from nanochat_jax.grad_utils import nnx_state_to_flat_dict # noqa: E402
 from nanochat_jax.loss_eval import evaluate_bpb # noqa: E402 —
@@ -92,6 +60,11 @@ def make_d12_config(
     window_pattern: str = "SSSL",
     bf16: bool = True,
     attn_impl: str = "xla",
+    lm_head_precision: str | None = None,
+    splash_block_q: int | None = None,
+    splash_block_kv: int | None = None,
+    splash_block_kv_compute: int | None = None,
+    ve_grad_impl: str = "scatter",
 ) -> GPTConfig:
     """d12 default config (I-02 cascade — §3.11 ).
 
@@ -111,6 +84,11 @@ def make_d12_config(
         window_pattern=window_pattern,
         compute_dtype=jnp.bfloat16 if bf16 else jnp.float32,
         attn_impl=attn_impl,
+        lm_head_precision=lm_head_precision,
+        splash_block_q=splash_block_q,
+        splash_block_kv=splash_block_kv,
+        splash_block_kv_compute=splash_block_kv_compute,
+        ve_grad_impl=ve_grad_impl,
     )
 
 
@@ -124,6 +102,11 @@ def make_config(
     window_pattern: str = "SSSL",
     bf16: bool = True,
     attn_impl: str = "xla",
+    lm_head_precision: str | None = None,
+    splash_block_q: int | None = None,
+    splash_block_kv: int | None = None,
+    splash_block_kv_compute: int | None = None,
+    ve_grad_impl: str = "scatter",
 ) -> GPTConfig:
     """ : PT 1:1 mirror of ``nanochat/scripts/base_train.py:build_model_meta``.
 
@@ -157,6 +140,11 @@ def make_config(
         window_pattern=window_pattern,
         compute_dtype=jnp.bfloat16 if bf16 else jnp.float32,
         attn_impl=attn_impl,
+        lm_head_precision=lm_head_precision,
+        splash_block_q=splash_block_q,
+        splash_block_kv=splash_block_kv,
+        splash_block_kv_compute=splash_block_kv_compute,
+        ve_grad_impl=ve_grad_impl,
     )
 
 
@@ -276,11 +264,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--attn-impl", type=str, default="xla", choices=["xla", "splash"],
-        help=" v4 (work 0036): attention implementation. "
+        help="Attention implementation. "
         "'xla' (default) = jax.nn.dot_product_attention(implementation='xla') "
-        "(regression preserved, / baseline). "
-        "'splash' = splash_attention_kernel TPU FlashAttention "
-        ".",
+        "; 'splash' = Splash Attention TPU kernel.",
     )
     parser.add_argument(
         "--num-iterations", type=int, default=-1,
@@ -307,7 +293,16 @@ def main() -> int:
     parser.add_argument(
         "--grad-accum-steps", type=int, default=1,
         help=" : gradient accumulation steps. Default 1. "
-        "Use >1 for v6e-8 + total_batch=524288 (Karpathy mirror, grad_accum=2).",
+        "Use >1 when per-device batch is smaller than the target token batch.",
+    )
+    parser.add_argument(
+        "--grad-accum-impl",
+        type=str,
+        default="loop",
+        choices=["loop", "fused"],
+        help="Gradient accumulation implementation. 'loop' keeps the existing "
+        "per-microbatch JIT path; 'fused' scans microbatches and applies the "
+        "optimizer inside one JIT call.",
     )
     parser.add_argument("--seq-len", type=int, default=2048, help="Sequence length")
     parser.add_argument("--vocab-size", type=int, default=32768)
@@ -346,13 +341,13 @@ def main() -> int:
         "--weights-out",
         type=str,
         default=None,
-        help="Optional final weights .npz path (M6 comparison source)",
+        help="Optional final weights .npz path.",
     )
     parser.add_argument(
         "--per-step-weights-out",
         type=str,
         default=None,
-        help="Optional dir for per-step weights .npz (M6 metric only — ~756MB × N steps)",
+        help="Optional dir for per-step weights .npz snapshots.",
     )
     parser.add_argument(
         "--save-every",
@@ -374,31 +369,23 @@ def main() -> int:
         help="Use bf16 compute (default; cascade). --no-bf16 disables.",
     )
     parser.add_argument("--no-bf16", dest="bf16", action="store_false")
-    # v8 (work 0039) — A/B test toggles for residual ~16% CORE gap.
-    # Default OFF preserves // v5/v6/v7 baseline regression.
     parser.add_argument(
         "--cast-embeddings-bf16",
         action="store_true",
         default=False,
-        help=" v8 (work 0039): cast wte and value_embeds Params to "
-        "compute_dtype after init_weights (PT 1:1 mirror of gpt.py:258-261). "
-        "Permanently stores embeddings as bf16 in bf16 mode → matches PT "
-        "memory layout AND optimizer state precision (bf16 quantization noise "
-        "may act as implicit regularization). Default off preserves baseline.",
+        help="Store token and value embeddings in compute dtype after init. "
+        "In bf16 mode this keeps embeddings and optimizer state in the same "
+        "precision regime as the PyTorch reference path.",
     )
     parser.add_argument(
         "--polar-express-bf16",
         action="store_true",
         default=False,
-        help=" v8 (work 0039): cast Muon gradient to bf16 before "
-        "Polar Express NS iterations (PT 1:1 mirror of optim.py:117). "
-        "Default off preserves baseline (NS in fp32). Affects all 24 layer "
-        "Muon groups × 16,704 steps.",
+        help="Cast Muon gradients to bf16 before Polar Express Newton-Schulz "
+        "iterations. Default off keeps Newton-Schulz in fp32.",
     )
-    # 0040 v9 fix candidate (Option B/C): TPU default fp32 matmul = bf16
-    # internal acc, lm_head 197x noise amp (work 0040 RESULT.md §0.1). 'highest' =
-    # 6-pass bf16 = near-fp32 acc (~2.5x slower step). For full retrain to
-    # validate Option B, pass --matmul-precision highest.
+    # TPU default fp32 matmul can use bf16 internal accumulation. ``highest``
+    # requests a slower, higher-accuracy accumulation path when needed.
     parser.add_argument(
         "--matmul-precision",
         type=str,
@@ -406,8 +393,41 @@ def main() -> int:
         choices=[None, "default", "high", "highest"],
         help="Override JAX default matmul precision (jax.config update). "
         "TPU default = bf16 internal acc (Fastest). 'highest' = 6-pass bf16 "
-        "= near-fp32 acc (~2.5x slower). For v9 retrain (0040 Option B) "
-        "use --matmul-precision=highest.",
+        "= near-fp32 acc (~2.5x slower).",
+    )
+    parser.add_argument(
+        "--lm-head-precision",
+        type=str,
+        default=None,
+        choices=[None, "default", "high", "highest"],
+        help="Override only the lm_head dot_general precision while leaving "
+        "global matmul precision unchanged.",
+    )
+    parser.add_argument(
+        "--splash-block-q",
+        type=int,
+        default=None,
+        help="Splash Attention block_q override. None keeps Splash defaults.",
+    )
+    parser.add_argument(
+        "--splash-block-kv",
+        type=int,
+        default=None,
+        help="Splash Attention block_kv override. None keeps Splash defaults.",
+    )
+    parser.add_argument(
+        "--splash-block-kv-compute",
+        type=int,
+        default=None,
+        help="Splash Attention block_kv_compute override. None uses min(block_kv, 128).",
+    )
+    parser.add_argument(
+        "--ve-grad-impl",
+        type=str,
+        default="scatter",
+        choices=["scatter", "onehot", "segsum", "segsum_fp32"],
+        help="Value-embedding backward implementation. Default scatter is the "
+        "baseline; onehot can improve TPU throughput at large vocab/sequence shapes.",
     )
     parser.add_argument(
         "--log-every",
@@ -420,7 +440,7 @@ def main() -> int:
         "--use-real-data",
         action="store_true",
         help=": use real ClimbMix dataloader instead of synthetic random batches "
-        "(default: synthetic, path). Required for M7 BPB comparison.",
+        "(default: synthetic). Required for meaningful quality evaluation.",
     )
     parser.add_argument(
         "--eval-only",
@@ -446,14 +466,12 @@ def main() -> int:
         "--checkpoint-every", type=int, default=-1,
         help=" : save intermediate checkpoint every N steps. -1 = disabled "
         "(only final saved if --checkpoint-dir set). 2000 recommended for spot "
-        "preemption safety (PLAN R-7 cascade).",
+        "preemption safety.",
     )
     parser.add_argument(
         "--keep-last-checkpoints", type=int, default=2,
-        help=" v5 (T06 fix per OPERATIONAL-TRAPS, work 0037): keep only the "
-        "last N intermediate checkpoints (rolling delete). Default 2 = ~11GB max "
-        "disk for d24 (5.5GB × 2). v4 hit disk full @ step 8000 with "
-        "16 ckpts × 5.5GB = 88GB / 100GB worker disk.",
+        help="Keep only the last N intermediate checkpoints. Default 2 bounds "
+        "disk usage during long spot runs.",
     )
     parser.add_argument(
         "--resume-from-step", type=int, default=-1,
@@ -462,9 +480,21 @@ def main() -> int:
         "checkpoint_dir.",
     )
     parser.add_argument(
+        "--stop-after-step",
+        type=int,
+        default=-1,
+        help="Stop after completing this train step. -1 disables.",
+    )
+    parser.add_argument(
+        "--no-final-checkpoint",
+        action="store_true",
+        help="Suppress the final/stop checkpoint. Periodic --checkpoint-every "
+        "checkpoints still fire.",
+    )
+    parser.add_argument(
         "--checkpoint-dir", type=str, default=None,
         help=" : directory for intermediate + final checkpoints. Default = "
-        "~/.cache/nanochat-tpu/base_checkpoints/{model_tag} if model_tag given.",
+        "get_base_dir()/base_checkpoints/{model_tag} if model_tag given.",
     )
     parser.add_argument(
         "--model-tag", type=str, default=None,
@@ -488,7 +518,7 @@ def main() -> int:
         "periodic-eval branch fires unconditionally on is_last_step. Periodic "
         "evals at multiples of --eval-every continue to fire. No effect when "
         "--eval-every=0. Saves ~5-40 min of duplicate eval when an external "
-        "base_eval.py pass runs after training (e.g. runs/d24.sh).",
+        "base_eval.py pass runs after training.",
     )
     parser.add_argument(
         "--token-bytes-path",
@@ -499,15 +529,12 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    # 0a. matmul precision override (TPU default fp32 matmul actually uses
-    # bf16 internal accumulation; see OPS docs). MUST apply BEFORE
+    # 0a. Matmul precision override. MUST apply BEFORE
     # jax.distributed.initialize / jax.devices so all subsequent compilation
     # respects the precision setting.
-    # See /RESULT.md §6.2 Option B.
     if args.matmul_precision is not None:
         jax.config.update("jax_default_matmul_precision", args.matmul_precision)
-        print(f"[info] jax_default_matmul_precision = {args.matmul_precision} "
-              "(0040 v9 fix candidate)")
+        print(f"[info] jax_default_matmul_precision = {args.matmul_precision}")
 
     # 1. Multi-host coordinator. On single-process JAX (CPU / single-host
     # TPU) this is a no-op. On v6e-8 2-host pod slice it must be called from
@@ -539,6 +566,13 @@ def main() -> int:
             f"device_batch_size={args.device_batch_size} seq_len={args.seq_len} "
             f"bf16={args.bf16} seed={args.seed}"
         )
+        print(
+            f"[info] attn_impl={args.attn_impl} "
+            f"lm_head_precision={args.lm_head_precision} "
+            f"splash_blocks=({args.splash_block_q}, {args.splash_block_kv}, "
+            f"{args.splash_block_kv_compute}) "
+            f"ve_grad_impl={args.ve_grad_impl}"
+        )
 
     # 3. config + model init (deterministic seed). generalize:
     # --use-pt-mirror-config activates make_config (aspect_ratio + head_dim).
@@ -554,6 +588,11 @@ def main() -> int:
             vocab_size=args.vocab_size,
             bf16=args.bf16,
             attn_impl=args.attn_impl,
+            lm_head_precision=args.lm_head_precision,
+            splash_block_q=args.splash_block_q,
+            splash_block_kv=args.splash_block_kv,
+            splash_block_kv_compute=args.splash_block_kv_compute,
+            ve_grad_impl=args.ve_grad_impl,
         )
     else:
         # / backward-compat (n_embd=768 hardcoded)
@@ -563,6 +602,11 @@ def main() -> int:
             vocab_size=args.vocab_size,
             bf16=args.bf16,
             attn_impl=args.attn_impl,
+            lm_head_precision=args.lm_head_precision,
+            splash_block_q=args.splash_block_q,
+            splash_block_kv=args.splash_block_kv,
+            splash_block_kv_compute=args.splash_block_kv_compute,
+            ve_grad_impl=args.ve_grad_impl,
         )
     rngs = nnx.Rngs(args.seed)
     model = GPT(config, rngs=rngs)
@@ -573,7 +617,7 @@ def main() -> int:
     if is_master and args.cast_embeddings_bf16:
         wte_dtype = model.transformer.wte.embedding.value.dtype
         print(
-            f"[info] v8: cast_embeddings_bf16=ON — wte.dtype = {wte_dtype}"
+            f"[info] cast_embeddings_bf16=ON — wte.dtype = {wte_dtype}"
         )
 
     # 4. total_batch_size + Karpathy-style LR/WD muP scaling → param_groups + optim_state
@@ -618,13 +662,12 @@ def main() -> int:
             f"(×{_D12_SCALING / _d_x_scaling:.4f} d12/model ratio)"
         )
 
-    # v8 (work 0039): optional Polar Express bf16 cast for Muon NS.
     polar_express_dtype = (
         config.compute_dtype if args.polar_express_bf16 else None
     )
     if is_master and polar_express_dtype is not None:
         print(
-            f"[info] v8: polar_express_bf16=ON — Muon NS dtype = {polar_express_dtype}"
+            f"[info] polar_express_bf16=ON — Muon NS dtype = {polar_express_dtype}"
         )
     param_groups, optim_state = init_train_state(
         model,
@@ -661,7 +704,8 @@ def main() -> int:
         print(
             f"[info] num_iterations = {num_iterations:,} "
             f"(total_batch_size = {total_batch_size_tokens:,} tokens, "
-            f"grad_accum_steps = {grad_accum_steps}, source = {horizon_source})"
+            f"grad_accum_steps = {grad_accum_steps}, "
+            f"grad_accum_impl = {args.grad_accum_impl}, source = {horizon_source})"
         )
 
     # 5. Mesh + sharded train_step factory
@@ -675,7 +719,23 @@ def main() -> int:
         set_splash_mesh(mesh)
     train_step = make_train_step_sharded(mesh, param_groups, optim_state)
     compute_grads_fn, accumulate_grads_fn, apply_update_fn = (None, None, None)
-    if grad_accum_steps > 1:
+    fused_step_fn = None
+    fused_state = None
+    fused_state_dirty = False
+    if grad_accum_steps > 1 and args.grad_accum_impl == "fused":
+        if is_master:
+            print(
+                "[info] fused grad accumulation enabled "
+                "(single jax.jit + lax.scan + optimizer update)"
+            )
+        fused_step_fn, fused_state = make_fused_train_step(
+            mesh,
+            param_groups,
+            optim_state,
+            model,
+            grad_accum_steps=grad_accum_steps,
+        )
+    elif grad_accum_steps > 1:
         compute_grads_fn, accumulate_grads_fn, apply_update_fn = make_grad_accum_fns(
             mesh, param_groups, optim_state
         )
@@ -685,6 +745,8 @@ def main() -> int:
     # 6. Batch generator — synthetic or real ClimbMix
     np_rng = np.random.default_rng(args.seed)
     train_loader = None
+    train_loader_state = None
+    make_train_loader = None
     val_loader = None
     tokenizer = None
     token_bytes = None
@@ -693,6 +755,7 @@ def main() -> int:
         # : import lazily so synthetic-only runs don't pay the deps
         from nanochat_jax.dataloader import ( # noqa: E402
             tokenizing_distributed_data_loader_bos_bestfit,
+            tokenizing_distributed_data_loader_with_state_bos_bestfit,
         )
         from nanochat_jax.tokenizer import get_token_bytes, get_tokenizer # noqa: E402
 
@@ -720,9 +783,21 @@ def main() -> int:
         # data-parallel devices. So **each process** yields B = device_batch_size
         # × local_device_count rows per step (PT mirror).
         per_process_train_batch = args.device_batch_size * max(local_device_count, 1)
-        train_loader = tokenizing_distributed_data_loader_bos_bestfit(
-            tokenizer, per_process_train_batch, args.seq_len, split="train"
-        )
+
+        def make_train_loader(resume_state_dict=None):
+            nonlocal train_loader_state
+            loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+                tokenizer,
+                per_process_train_batch,
+                args.seq_len,
+                split="train",
+                resume_state_dict=resume_state_dict,
+            )
+            for inputs, targets, state_dict in loader:
+                train_loader_state = dict(state_dict)
+                yield inputs, targets
+
+        train_loader = make_train_loader()
         if is_master:
             print(
                 f"[info] train_loader: split=train per_process_batch="
@@ -765,9 +840,7 @@ def main() -> int:
         or args.resume_from_step >= 0
         or args.model_tag is not None
     ):
-        checkpoint_dir = os.path.expanduser(
-            f"~/.cache/nanochat-tpu/base_checkpoints/{model_tag}"
-        )
+        checkpoint_dir = os.path.join(get_base_dir(), "base_checkpoints", model_tag)
     else:
         checkpoint_dir = None
     if checkpoint_dir is not None and is_master:
@@ -785,8 +858,16 @@ def main() -> int:
         if is_master:
             print(f"[info] Resuming from step {args.resume_from_step} in {checkpoint_dir}")
         model_data, optimizer_data, meta_data = load_checkpoint(
-            checkpoint_dir, args.resume_from_step, load_optimizer=False,
+            checkpoint_dir,
+            args.resume_from_step,
+            load_optimizer=True,
+            rank=process_idx,
         )
+        if optimizer_data is None:
+            raise FileNotFoundError(
+                "Optimizer checkpoint is required for --resume-from-step but "
+                f"was not found for rank {process_idx} at step {args.resume_from_step}"
+            )
         # Inject PT state_dict into NNX model (T07 fix per OPERATIONAL-TRAPS,
         # work 0037 Phase 0b). `inject_pt_linear_weight` is a single-Linear
         # helper, NOT a full-GPT injector — calling it on a GPT + dict raises
@@ -797,9 +878,51 @@ def main() -> int:
         from nanochat_jax.weight_converter import pt_state_dict_to_jax
         jax_dict = pt_state_dict_to_jax(model_data, target_dtype=None)
         inject_pt_state_dict(model, jax_dict)
+        from nanochat_jax.checkpoint_manager import _pt_dict_to_muon_adamw_state
+        optim_state = _pt_dict_to_muon_adamw_state(optimizer_data)
+        if args.use_real_data:
+            resume_train_loader_state = (
+                meta_data.get("train_loader_state")
+                or meta_data.get("dataloader_state")
+            )
+            if resume_train_loader_state is None or make_train_loader is None:
+                raise KeyError(
+                    "train_loader_state is required for real-data --resume-from-step"
+                )
+            train_loader = make_train_loader(resume_train_loader_state)
+            if is_master:
+                print(
+                    "[info] Resumed train loader state "
+                    f"{resume_train_loader_state}"
+                )
+        else:
+            synthetic_rng_state = meta_data.get("synthetic_rng_state")
+            if synthetic_rng_state is None:
+                raise KeyError(
+                    "synthetic_rng_state is required for synthetic --resume-from-step"
+                )
+            np_rng.bit_generator.state = synthetic_rng_state
         start_step = args.resume_from_step + 1
         if is_master:
             print(f"[info] Resumed: starting from step {start_step}")
+
+        train_step = make_train_step_sharded(mesh, param_groups, optim_state)
+        compute_grads_fn, accumulate_grads_fn, apply_update_fn = (None, None, None)
+        fused_step_fn = None
+        fused_state = None
+        fused_state_dirty = False
+        if grad_accum_steps > 1 and args.grad_accum_impl == "fused":
+            fused_step_fn, fused_state = make_fused_train_step(
+                mesh,
+                param_groups,
+                optim_state,
+                model,
+                grad_accum_steps=grad_accum_steps,
+            )
+        elif grad_accum_steps > 1:
+            compute_grads_fn, accumulate_grads_fn, apply_update_fn = make_grad_accum_fns(
+                mesh, param_groups, optim_state
+            )
 
     num_iter = 0 if args.eval_only else num_iterations
 
@@ -854,6 +977,12 @@ def main() -> int:
                 "vocab_size": config.vocab_size,
                 "sequence_len": config.sequence_len,
                 "window_pattern": config.window_pattern,
+                "attn_impl": config.attn_impl,
+                "lm_head_precision": config.lm_head_precision,
+                "splash_block_q": config.splash_block_q,
+                "splash_block_kv": config.splash_block_kv,
+                "splash_block_kv_compute": config.splash_block_kv_compute,
+                "ve_grad_impl": config.ve_grad_impl,
             },
             "depth": args.depth,
             "aspect_ratio": args.aspect_ratio,
@@ -861,7 +990,12 @@ def main() -> int:
             "device_batch_size": args.device_batch_size,
             "max_seq_len": args.seq_len,
             "total_batch_size": total_batch_size_tokens,
+            "grad_accum_steps": grad_accum_steps,
+            "grad_accum_impl": args.grad_accum_impl,
             "num_iterations": num_iter,
+            "executed_num_iterations": step + 1,
+            "stop_after_step": args.stop_after_step,
+            "last_executed_step": step,
             "matrix_lr": args.matrix_lr,
             "embedding_lr": args.embedding_lr,
             "unembedding_lr": args.unembedding_lr,
@@ -872,6 +1006,10 @@ def main() -> int:
             "warmdown_ratio": args.warmdown_ratio,
             "final_lr_frac": args.final_lr_frac,
             "seed": args.seed,
+            "train_loader_state": train_loader_state,
+            "synthetic_rng_state": (
+                np_rng.bit_generator.state if not args.use_real_data else None
+            ),
             "loop_state": {
                 "min_val_bpb": min(losses) if losses else None,
                 "smooth_train_loss": float(np.mean(losses[-100:])) if losses else None,
@@ -880,7 +1018,7 @@ def main() -> int:
         }
         save_checkpoint(
             checkpoint_dir, step, model,
-            optim_state=None, # cascade — optim shard not saved
+            optim_state=optim_state,
             meta_data=meta, rank=process_idx,
         )
         if is_master:
@@ -898,6 +1036,12 @@ def main() -> int:
                     f"[info] Rolling delete: removed {deleted} old "
                     f"checkpoint(s), kept last {keep_last}"
                 )
+
+    def _sync_fused_model_state() -> None:
+        nonlocal fused_state_dirty
+        if fused_state_dirty and fused_state is not None:
+            nnx.update(model, fused_state)
+            fused_state_dirty = False
 
     for step in range(start_step, num_iter):
         step_start_time = time.time()
@@ -921,7 +1065,40 @@ def main() -> int:
             get_weight_decay(step, num_iterations, weight_decay_scaled)
         )
 
-        if grad_accum_steps <= 1:
+        if grad_accum_steps > 1 and args.grad_accum_impl == "fused":
+            if args.use_real_data:
+                idx_chunks = []
+                target_chunks = []
+                for _ in range(grad_accum_steps):
+                    inputs_np, targets_np = next(train_loader)
+                    idx_chunks.append(np.array(inputs_np, copy=True))
+                    target_chunks.append(np.array(targets_np, copy=True))
+                idx_all = jnp.asarray(np.stack(idx_chunks, axis=0))
+                targets_all = jnp.asarray(np.stack(target_chunks, axis=0))
+            else:
+                idx_np, targets_np = make_synthetic_batch(
+                    np_rng,
+                    global_batch_size * grad_accum_steps,
+                    args.seq_len,
+                    config.vocab_size,
+                )
+                idx_all = jnp.asarray(
+                    idx_np.reshape(grad_accum_steps, global_batch_size, args.seq_len)
+                )
+                targets_all = jnp.asarray(
+                    targets_np.reshape(grad_accum_steps, global_batch_size, args.seq_len)
+                )
+            fused_state, optim_state, loss = fused_step_fn(
+                fused_state,
+                optim_state,
+                idx_all,
+                targets_all,
+                lrm,
+                mom,
+                wd,
+            )
+            fused_state_dirty = True
+        elif grad_accum_steps <= 1:
             # Fast path: no accumulation (same as before)
             if args.use_real_data:
                 inputs_np, targets_np = next(train_loader)
@@ -984,6 +1161,7 @@ def main() -> int:
         # 7e. Per-step weights save (M6 metric, master only). Step 0 + final
         # always saved; intermediate steps every --save-every steps.
         if args.per_step_weights_out is not None and is_master:
+            _sync_fused_model_state()
             save_this_step = (
                 step == 0
                 or step == num_iterations - 1
@@ -1021,8 +1199,9 @@ def main() -> int:
         # Save at: last_step OR (step > 0 AND step != resume_from_step AND
         # checkpoint_every > 0 AND step % checkpoint_every == 0). PT 1:1 mirror.
         is_last_step = step == num_iterations - 1
+        stop_requested = args.stop_after_step >= 0 and step >= args.stop_after_step
         save_this = (
-            is_last_step
+            ((is_last_step or stop_requested) and not args.no_final_checkpoint)
             or (
                 step > 0
                 and step != args.resume_from_step
@@ -1031,6 +1210,7 @@ def main() -> int:
             )
         )
         if save_this and checkpoint_dir is not None:
+            _sync_fused_model_state()
             # val_bpb not yet available — eval runs after save. Recorded in
             # training_log.jsonl after eval completes; meta.json val_bpb = null.
             _save_intermediate_checkpoint(step, val_bpb=None)
@@ -1050,6 +1230,7 @@ def main() -> int:
             args.eval_every > 0 and is_last_step and not args.no_final_eval
         )
         if fire_periodic or fire_final:
+            _sync_fused_model_state()
             eval_t0 = time.time()
             val_bpb_periodic = _eval_val_bpb_now(step)
             eval_elapsed = time.time() - eval_t0
@@ -1070,6 +1251,13 @@ def main() -> int:
                             "wd": float(wd),
                             "elapsed": time.time() - t0,
                         }) + "\n")
+
+        if stop_requested:
+            if is_master:
+                print(f"[info] stop_after_step={args.stop_after_step} reached")
+            break
+
+    _sync_fused_model_state()
 
     # 8. Final weights save
     if args.weights_out is not None and is_master:

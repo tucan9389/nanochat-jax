@@ -113,8 +113,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "HuggingFace model path. NOT IMPLEMENTED in JAX-port — "
-            "use PT base_eval directly for HF model evaluation. "
-            "(ADR-0004 §out of scope)"
+            "use PT base_eval directly for HF model evaluation."
         ),
     )
     # PT mirror: --source
@@ -147,9 +146,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=100,
         help=(
-            "(CORE-only) Max examples per CORE task. Default 100 (PT m7_jax "
-            "cross-validation). -1 = all (full 22 "
-            "tasks ~60K examples; ~6h Mac CPU, use TPU)."
+            "(CORE-only) Max examples per CORE task. Default 100. "
+            "-1 = all examples; full CORE is slow and should run on TPU."
         ),
     )
     # PT mirror: --device-batch-size
@@ -168,10 +166,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=4,
         help=(
-            "Number of eval batches per BPB split "
-            "default; ADR-0006 §2 protocol = 20 for strict tier on TPU). "
-            "Total tokens evaluated = eval_steps × device_batch_size × "
-            "sequence_len × jax.device_count()."
+            "Number of eval batches per BPB split. Total tokens evaluated per "
+            "process = eval_steps × device_batch_size × sequence_len."
         ),
     )
     # PT mirror: --device-type 
@@ -242,7 +238,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help=(
-            "Output JSON path (default: ~/.cache/nanochat/base_eval/"
+            "Output JSON path (default: get_base_dir()/base_eval/"
             "{model_slug}.json). Use - to skip writing."
         ),
     )
@@ -257,9 +253,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Recommended for TPU spot runs (preemption recovery)."
         ),
     )
-    # TPU default fp32 matmul actually uses bf16 internal accumulation;
-    # internal acc, lm_head 197x noise amp. HIGHEST forces 6-pass bf16 → near-fp32
-    # acc, ~2.5x slower step. 
+    # TPU default fp32 matmul can use bf16 internal accumulation; highest
+    # requests a slower, higher-accuracy accumulation path when needed.
     parser.add_argument(
         "--matmul-precision",
         type=str,
@@ -268,8 +263,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Override JAX default matmul precision (jax.config update). "
             "TPU default = bf16 internal acc (Fastest). 'highest' = 6-pass bf16 "
-            "= near-fp32 acc (~2.5x slower). See OPS_PLAYBOOK / docs for the "
-            "(0040 RESULT.md §6.2 Option A) use --matmul-precision=highest."
+            "= near-fp32 acc (~2.5x slower)."
         ),
     )
     parser.add_argument(
@@ -277,8 +271,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help=(
-            "Override checkpoints base dir (default: ~/.cache/nanochat/ for "
-            "nanochat-jax cache directory)"
+            "Override checkpoints base dir (default: nanochat-jax cache directory)"
         ),
     )
     return parser
@@ -458,12 +451,9 @@ PT mirror: ``nanochat/scripts/base_eval.py:107-173`` (substitution 0
         if max_per_task > 0:
             data = data[:max_per_task]
 
-        # T18 fix per OPERATIONAL-TRAPS (work 0036/0037): guard against
-        # `random.sample(available, num_fewshot)` ValueError in core_eval.py:328.
-        # `available` = len(data) - 1 (current item excluded), so we need
-        # at least num_fewshot + 1 samples. Without this guard,
-        # `--max-per-task=10` with `num_fewshot=10` ICL tasks crashes mid-eval
-        #.
+        # Guard against `random.sample(available, num_fewshot)` ValueError in
+        # core_eval.py. `available` = len(data) - 1 (current item excluded), so
+        # we need at least num_fewshot + 1 samples.
         num_fewshot_req = task_meta["num_fewshot"]
         if max_per_task > 0 and len(data) < num_fewshot_req + 1:
             raise ValueError(
@@ -471,7 +461,7 @@ PT mirror: ``nanochat/scripts/base_eval.py:107-173`` (substitution 0
                 f"num_fewshot={num_fewshot_req} requires at least "
                 f"{num_fewshot_req + 1} samples (current data: {len(data)}). "
                 f"Increase --max-per-task to {num_fewshot_req + 1} or higher "
-                f"(default 100 recommended for safety, T18 cookbook)."
+                f"(default 100 recommended for safety)."
             )
 
         # JAX-port: device kept for PT 1:1 signature (unused, jax handles)
@@ -555,7 +545,7 @@ def _hf_not_implemented(args: argparse.Namespace) -> None:
     """Raise NotImplementedError for --hf-path .
 
     HuggingFace model evaluation requires:
-    - transformers package (not in nanochat-tpu dev venv, ADR-0004 §out of scope)
+    - transformers package
     - HuggingFaceTokenizer (PT-only path)
     - ModelWrapper for nanochat-compatible interface
 
@@ -563,9 +553,8 @@ def _hf_not_implemented(args: argparse.Namespace) -> None:
     """
     raise NotImplementedError(
         "HuggingFace model evaluation (--hf-path) is not implemented in "
-        "nanochat-tpu. Use PT base_eval directly: "
-        "torchrun --nproc_per_node=N -m scripts.base_eval --hf-path <path>. "
-        "Reference: docs/decisions/0004-porting-scope.md §out of scope."
+        "nanochat-jax. Use PT base_eval directly: "
+        "torchrun --nproc_per_node=N -m scripts.base_eval --hf-path <path>."
     )
 
 
@@ -691,12 +680,12 @@ def _run_bpb_mode(
     _print0("BPB Evaluation")
     _print0("=" * 80)
 
-    # PT base_eval.py:265-269 mirror — adjust eval_steps to be divisible
-    # PT logic: tokens_per_step = device_batch_size * sequence_len * world_size
-    # JAX-port simplified: --eval-steps directly
+    # PT base_eval.py mirror: each process evaluates ``device_batch_size`` rows
+    # per step. This path is not pmap/shard_map based, so local TPU device count
+    # must not multiply the dataloader batch size.
     local_device_count = max(jax.local_device_count(), 1)
     process_count = max(jax.process_count(), 1)
-    per_process_batch = args.device_batch_size * local_device_count
+    per_process_batch = args.device_batch_size
     tokens_per_step = per_process_batch * sequence_len * process_count
     total_tokens_per_split = args.eval_steps * tokens_per_step
 
@@ -748,11 +737,8 @@ def _resolve_out_path(
     if args.out:
         return args.out
 
-    # Default: ~/.cache/nanochat/base_eval/{model_slug}.json (PT cohabit)
-    base_dir = os.environ.get(
-        "NANOCHAT_BASE_DIR",
-        os.path.join(os.path.expanduser("~"), ".cache", "nanochat"),
-    )
+    # Default: get_base_dir()/base_eval/{model_slug}.json
+    base_dir = get_base_dir()
     out_dir = os.path.join(base_dir, "base_eval")
     os.makedirs(out_dir, exist_ok=True)
     return os.path.join(out_dir, f"{model_slug}.json")
@@ -838,14 +824,9 @@ def main(argv: list[str] | None = None) -> int:
     # 2b. matmul precision override.
     # MUST be applied BEFORE jax.distributed.initialize() / jax.devices() to
     # affect compilation.
-    # §0.1: TPU default fp32 matmul = bf16 internal acc, lm_head 197x noise amp.
-    # 'highest' = 6-pass bf16 = near-fp32 acc (~2.5x slower).
     if args.matmul_precision is not None:
         jax.config.update("jax_default_matmul_precision", args.matmul_precision)
-        _print0(
-            f"[info] jax_default_matmul_precision = {args.matmul_precision} "
-            "(0040 RESULT §6.2 Option A — fp32 lm_head matmul accuracy fix)"
-        )
+        _print0(f"[info] jax_default_matmul_precision = {args.matmul_precision}")
 
     # 3. Distributed setup 
     if not args.no_distributed:

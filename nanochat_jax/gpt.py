@@ -14,6 +14,8 @@ Notable features (mirroring upstream nanochat):
 
 from __future__ import annotations
 
+import dataclasses
+import functools
 from dataclasses import dataclass
 from typing import Literal
 
@@ -55,11 +57,23 @@ def get_splash_mesh() -> "jax.sharding.Mesh | None":
     return _ACTIVE_SPLASH_MESH
 
 
-def _make_splash_kernel(T: int, n_head: int, window_left: int, interpret: bool = False):
+def _make_splash_kernel(
+    T: int,
+    n_head: int,
+    window_left: int,
+    interpret: bool = False,
+    *,
+    block_q: int | None = None,
+    block_kv: int | None = None,
+    block_kv_compute: int | None = None,
+):
     """Build a Splash MHA kernel for the given ``(T, n_head, window_left)``.
 
     ``window_left < 0`` or ``>= T`` means full causal mask. Otherwise the kernel
     is built with ``CausalMask & LocalMask`` for sliding-window attention.
+
+    ``block_q`` / ``block_kv`` tune the Splash/Mosaic tile sizes. ``None`` keeps
+    Splash defaults. The setting changes TPU performance, not model math.
 
     Note: do NOT cache this builder with ``functools.lru_cache``. Inside an
     ``nnx.jit`` trace the cache leaks intermediate JAX tracers and triggers
@@ -85,8 +99,31 @@ def _make_splash_kernel(T: int, n_head: int, window_left: int, interpret: bool =
             offset=0,
         )
     multi_head_mask = sam.MultiHeadMask(masks=(mask,) * n_head)
+    block_sizes = None
+    if block_q is not None or block_kv is not None:
+        if block_q is None or block_kv is None:
+            raise ValueError("splash block_q and block_kv must be set together")
+        if block_q <= 0 or block_kv <= 0:
+            raise ValueError("splash block sizes must be positive")
+        bkc = block_kv_compute if block_kv_compute is not None else min(block_kv, 128)
+        if bkc <= 0 or bkc % 128 != 0:
+            raise ValueError(
+                "splash block_kv_compute must be a positive multiple of 128"
+            )
+        block_sizes = dataclasses.replace(
+            sak.BlockSizes.get_default(),
+            block_q=block_q,
+            block_kv=block_kv,
+            block_kv_compute=bkc,
+            block_q_dkv=block_q,
+            block_kv_dkv=block_kv,
+            block_kv_dkv_compute=bkc,
+            block_q_dq=block_q,
+            block_kv_dq=block_kv,
+        )
     return sak.make_splash_mha_single_device(
         mask=multi_head_mask,
+        block_sizes=block_sizes,
         is_mqa=False,
         head_shards=1,
         q_seq_shards=1,
@@ -103,6 +140,9 @@ def _call_splash_attention(
     interpret: bool = False,
     mesh: "jax.sharding.Mesh | None" = None,
     data_axis: str = "data",
+    block_q: int | None = None,
+    block_kv: int | None = None,
+    block_kv_compute: int | None = None,
 ) -> jax.Array:
     """Splash attention call. Inputs and outputs are BTND.
 
@@ -121,7 +161,15 @@ def _call_splash_attention(
     n_head = q.shape[2]
     head_dim = q.shape[3]
     window_left = window_size[0]
-    splash_kernel = _make_splash_kernel(T, n_head, window_left, interpret)
+    splash_kernel = _make_splash_kernel(
+        T,
+        n_head,
+        window_left,
+        interpret,
+        block_q=block_q,
+        block_kv=block_kv,
+        block_kv_compute=block_kv_compute,
+    )
 
     scale = jax.lax.rsqrt(jnp.asarray(head_dim, dtype=jnp.float32))
     q_scaled = (q.astype(jnp.float32) * scale).astype(q.dtype)
@@ -181,11 +229,69 @@ class GPTConfig:
     window_pattern: str = "L"
     compute_dtype: jnp.dtype = jnp.float32
     attn_impl: Literal["xla", "splash"] = "xla"
+    lm_head_precision: "jax.lax.PrecisionLike | None" = None
+    splash_block_q: int | None = None
+    splash_block_kv: int | None = None
+    splash_block_kv_compute: int | None = None
+    ve_grad_impl: Literal["scatter", "onehot", "segsum", "segsum_fp32"] = "scatter"
 
 
 def has_ve(layer_idx: int, n_layer: int) -> bool:
     """True if layer ``layer_idx`` carries a value embedding (alternating, last layer always)."""
     return layer_idx % 2 == (n_layer - 1) % 2
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
+def ve_lookup(table: jax.Array, idx: jax.Array, impl: str) -> jax.Array:
+    """Value-embedding lookup with an optional custom backward implementation.
+
+    Forward is identical to ``nnx.Embed``. ``impl="scatter"`` keeps the default
+    path. ``impl="onehot"`` computes the table gradient as ``one_hot(idx).T @ g``.
+    """
+    return jnp.take(table, idx, axis=0)
+
+
+def _ve_lookup_fwd(table: jax.Array, idx: jax.Array, impl: str):
+    return jnp.take(table, idx, axis=0), (table.shape[0], idx)
+
+
+def _ve_lookup_bwd(impl: str, res, g: jax.Array):
+    num_embeddings, idx = res
+    flat_idx = idx.reshape(-1)
+    flat_g = g.reshape(-1, g.shape[-1])
+    if impl == "onehot":
+        one_hot = jax.nn.one_hot(flat_idx, num_embeddings, dtype=jnp.float32)
+        grad_table = jax.lax.dot_general(
+            one_hot,
+            flat_g.astype(jnp.float32),
+            (((0,), (0,)), ((), ())),
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
+        )
+    elif impl == "segsum_fp32":
+        grad_table = jax.ops.segment_sum(
+            flat_g.astype(jnp.float32),
+            flat_idx,
+            num_segments=num_embeddings,
+        )
+    elif impl == "segsum":
+        grad_table = jax.ops.segment_sum(
+            flat_g,
+            flat_idx,
+            num_segments=num_embeddings,
+        )
+    else:
+        raise ValueError(f"unknown ve_grad_impl={impl!r}")
+    return (grad_table.astype(g.dtype), None)
+
+
+ve_lookup.defvjp(_ve_lookup_fwd, _ve_lookup_bwd)
+
+
+def _ve(embed: "nnx.Embed", idx: jax.Array, impl: str) -> jax.Array:
+    if impl == "scatter":
+        return embed(idx)
+    return ve_lookup(embed.embedding.value, idx, impl)
 
 
 def _compute_window_sizes(cfg: "GPTConfig") -> list[tuple[int, int]]:
@@ -304,6 +410,9 @@ class CausalSelfAttention(nnx.Module):
         self.head_dim = cfg.n_embd // cfg.n_head
         self.ve_gate_channels = 12
         self.attn_impl: Literal["xla", "splash"] = cfg.attn_impl
+        self.splash_block_q = cfg.splash_block_q
+        self.splash_block_kv = cfg.splash_block_kv
+        self.splash_block_kv_compute = cfg.splash_block_kv_compute
 
         self.c_q = NanochatLinear(cfg.n_embd, cfg.n_head * self.head_dim, rngs=rngs)
         self.c_k = NanochatLinear(cfg.n_embd, cfg.n_kv_head * self.head_dim, rngs=rngs)
@@ -356,7 +465,15 @@ class CausalSelfAttention(nnx.Module):
                     "attn_impl='splash' currently requires MHA; got "
                     f"n_head={self.n_head}, n_kv_head={self.n_kv_head}."
                 )
-                y = _call_splash_attention(q, k, v, window_size=window_size)
+                y = _call_splash_attention(
+                    q,
+                    k,
+                    v,
+                    window_size=window_size,
+                    block_q=self.splash_block_q,
+                    block_kv=self.splash_block_kv,
+                    block_kv_compute=self.splash_block_kv_compute,
+                )
             else:
                 y = jax.nn.dot_product_attention(
                     q, k, v,
@@ -462,7 +579,12 @@ class GPT(nnx.Module):
         kv_dim = cfg.n_kv_head * head_dim
 
         self.transformer = Transformer(cfg, padded_vocab_size, rngs=rngs)
-        self.lm_head = NanochatLinear(cfg.n_embd, padded_vocab_size, rngs=rngs)
+        self.lm_head = NanochatLinear(
+            cfg.n_embd,
+            padded_vocab_size,
+            precision=cfg.lm_head_precision,
+            rngs=rngs,
+        )
 
         self.resid_lambdas = nnx.Param(jnp.ones((cfg.n_layer,), dtype=jnp.float32))
         self.x0_lambdas = nnx.Param(jnp.zeros((cfg.n_layer,), dtype=jnp.float32))
@@ -710,7 +832,7 @@ class GPT(nnx.Module):
                 + self.x0_lambdas[i].astype(x.dtype) * x0
             )
             ve = (
-                self.value_embeds[str(i)](idx).astype(x.dtype)
+                _ve(self.value_embeds[str(i)], idx, cfg.ve_grad_impl).astype(x.dtype)
                 if str(i) in self.value_embeds
                 else None
             )
@@ -792,7 +914,7 @@ class GPT(nnx.Module):
             if granularity == "high":
                 ints[f"block_{i}_input"] = x_block_in
             ve = (
-                self.value_embeds[str(i)](idx).astype(x.dtype)
+                _ve(self.value_embeds[str(i)], idx, cfg.ve_grad_impl).astype(x.dtype)
                 if str(i) in self.value_embeds
                 else None
             )

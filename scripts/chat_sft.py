@@ -54,6 +54,7 @@ from nanochat_jax.checkpoint_manager import ( # noqa: E402
 )
 from nanochat_jax.common import ( # noqa: E402
     download_file_with_lock,
+    get_base_dir,
     setup_distributed_env_vars,
 )
 from nanochat_jax.loss_eval import evaluate_bpb # noqa: E402
@@ -306,7 +307,7 @@ def sft_data_generator_bos_bestfit(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description=" SFT (Supervised Fine-Tuning) for nanochat-tpu"
+        description=" SFT (Supervised Fine-Tuning) for nanochat-jax"
     )
     # Logging
     parser.add_argument("--run", type=str, default="dummy",
@@ -532,10 +533,7 @@ def main() -> int:
     # ---------------------------------------------------------------------
     # SFT data mixture: CustomJSON identity (Q-1 (B) scope)
     # ---------------------------------------------------------------------
-    base_dir = os.environ.get(
-        "NANOCHAT_BASE_DIR",
-        os.path.join(os.path.expanduser("~"), ".cache", "nanochat"),
-    )
+    base_dir = get_base_dir()
     identity_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
     if not os.path.exists(identity_filepath):
         _print0(f"identity_conversations.jsonl not found, downloading from {IDENTITY_CONVERSATIONS_URL}")

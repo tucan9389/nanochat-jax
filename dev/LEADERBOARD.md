@@ -1,44 +1,48 @@
 # Leaderboard
 
-Reference numbers from this repository alongside upstream nanochat for comparison. The primary metric is **CORE** (DCLM 22-task ICL), as in upstream nanochat ("time to GPT-2"). `val_bpb` is the secondary metric.
+Upstream nanochat measures Time-to-GPT-2: training wall-clock time needed to beat GPT-2 `CORE=0.256525` on an 8xH100 node. The upstream rows below are reference context.
 
-> Cross-framework / cross-device numerical agreement is bounded by the bf16-on-TPU mantissa floor (~9% per published cross-device studies and ~6.4% within Karpathy's own commit-to-commit variance). Numbers below should be read with that floor in mind.
-
-## Upstream nanochat (PyTorch + GPU, reference)
+## Upstream nanochat (PyTorch + GPU)
 
 Excerpted from [`karpathy/nanochat/dev/LEADERBOARD.md`](https://github.com/karpathy/nanochat/blob/master/dev/LEADERBOARD.md):
 
-| # | wall (h) | val_bpb | CORE | Description | Date | Commit |
-|---|---------|---------|--------|-------------|------|--------|
-| 0 | 168.0 | -- | 0.2565 | OpenAI GPT-2 1.6B (reference) | 2019 | -- |
-| 1 | 3.04 | 0.74833 | 0.2585 | d24 baseline, slightly overtrained | Jan 29 2026 | 348fbb3 |
-| 2 | 2.91 | 0.74504 | 0.2578 | d26 slightly undertrained, +fp8 | Feb 2 2026 | a67eba3 |
-| 3 | 2.76 | 0.74645 | 0.2602 | total_batch=1M tokens | Feb 5 2026 | 2c062aa |
-| 4 | 2.02 | 0.71854 | 0.2571 | dataset = NVIDIA ClimbMix | Mar 4 2026 | 324e69c |
-| 5 | 1.80 | 0.71808 | 0.2690 | autoresearch round 1 | Mar 9 2026 | 6ed7d1d |
-| 6 | 1.65 | 0.71800 | 0.2626 | autoresearch round 2 | Mar 14 2026 | a825e63 |
+| # | time (h) | val_bpb | CORE | Description | Date | Commit | Contributors |
+|---|---:|---:|---:|---|---|---|---|
+| 0 | 168.0 | -- | 0.2565 | OpenAI GPT-2 1.6B reference | 2019 | -- | OpenAI |
+| 1 | 3.04 | 0.74833 | 0.2585 | d24 baseline, slightly overtrained | Jan 29 2026 | 348fbb3 | @karpathy |
+| 2 | 2.91 | 0.74504 | 0.2578 | d26 slightly undertrained, +fp8 | Feb 2 2026 | a67eba3 | @karpathy |
+| 3 | 2.76 | 0.74645 | 0.2602 | total_batch=1M tokens | Feb 5 2026 | 2c062aa | @karpathy |
+| 4 | 2.02 | 0.71854 | 0.2571 | dataset = NVIDIA ClimbMix | Mar 4 2026 | 324e69c | @ddudek @karpathy |
+| 5 | 1.80 | 0.71808 | 0.2690 | autoresearch round 1 | Mar 9 2026 | 6ed7d1d | @karpathy |
+| 6 | 1.65 | 0.71800 | 0.2626 | autoresearch round 2 | Mar 14 2026 | a825e63 | @karpathy |
 
-## nanochat-jax (this repository, JAX + TPU)
+Upstream reports training time excluding evaluation and logging time.
 
-Three d24 runs on v5p spot TPU, all full 16,704-iteration trains mirroring Karpathy's Run 1 spec (batch 524,288, target-param-data-ratio 12, ClimbMix 170 shards, bf16, xla attention). The first two are a paired comparison on `--matmul-precision`; the third is the same spec on smaller single-host hardware.
+## nanochat-jax (JAX + TPU)
 
-| Date | Hardware | Wall (h) | Cost (spot list-price) | Model | Steps | val_bpb | CORE | Notes |
-|---|---|---|---|---|---|---|---|---|
-| 2026-05-05 | v5p-32 us-east5 spot (16 chips, ~$25.5/hr) | ~8 (train + eval) | ~$205 | d24, bf16, ClimbMix 170 shards, **default precision** | 16704 | 0.832 | 0.1774 | Baseline; no `--matmul-precision` flag. 31% CORE gap from upstream d24 baseline 0.2585. |
-| 2026-05-08 | v5p-32 spot (16 chips) | ~8 (train + eval) | ~$205 | d24, bf16 + **`--matmul-precision=highest`**, ClimbMix 170 shards | 16704 | 0.7596 | **0.227** | +27.6% CORE vs the row above from `--matmul-precision=highest` (see Implementation notes). Single seed. |
-| 2026-05-13 | v5p-8 europe-west4 spot (4 chips, ~$5.1/hr) | ~28 (train) | ~$145 | d24, bf16 + **`--matmul-precision=highest`**, ClimbMix 170 shards | 16704 | 0.7042 | **0.290** | Same setup as the row above but on single-host v5p-8 vs multi-host v5p-32. +27.7% gap from the multi-host row, cause unclear (cross-host bf16 all-reduce noise is one candidate). Single seed. |
+This table uses the upstream append style: one row per completed public-result run. It is separate from upstream Time-to-GPT-2 because the hardware, runtime, and eval hosts differ.
 
-## Methodology
+| # | time (h) | val_bpb | CORE | Description | Date | Commit | Contributors |
+|---|---:|---:|---:|---|---|---|---|
+| 0 | 168.0 | -- | 0.2565 | OpenAI GPT-2 1.6B reference | 2019 | -- | OpenAI |
+| 1 | 7.33* | 0.71879 | 0.27409 | d24 baseline on v6e-8 spot TPU, final checkpoint | Jun 3 2026 | 956e043 | @tucan9389 |
 
-- `val_bpb` is computed via `python -m scripts.base_eval --eval bpb`. The validation split is the last shard of ClimbMix.
-- `CORE` is the DCLM 22-task ICL average, computed via `python -m scripts.base_eval --eval core --max-per-task 100`.
-- Cost is approximate, derived from list-price spot rates × wall time. Spot pricing fluctuates by region and capacity (europe-west4 spot is typically ~20% cheaper than us-east5).
+`*` Row 1 time is the estimated full 16,704-step train-loop time. Eval and logging are excluded to match the upstream timing convention.
 
-## Implementation notes (TPU-specific)
+CORE means `max_per_task=-1` and 22/22 tasks. BPB and CORE for row 1 were measured with A100 eval workers. Intermediate checkpoints are not separate leaderboard rows.
 
-These are JAX/TPU surprises encountered while reproducing the d24 spec on v5p TPU pods. They are not in the upstream nanochat repo because they only show up on TPU. None of them are bugs in the spec itself.
+Row 1 config: `seq_len=2048`, `n_layer=24`, `n_embd=1536`, `n_head=12`, `524288` tokens/step, `16704` total steps, Splash Attention, value embeddings enabled, `ve_grad_impl=onehot`.
 
-- **`--matmul-precision highest` is required for d24+.** This is the single largest knob on TPU. JAX's default fp32 matmul on TPU silently uses bf16 internal accumulation for the matmul output, which materially degrades converged CORE (paired runs above: 0.1774 → 0.227, +27.6%). The cost is a modest sec/step slowdown (~5-10% on v5p in practice; the published "2.5×" figure does not match what we measured on v5p MXUs). At d12 scale and short trains the effect is in the noise; the regime where it matters is roughly d24 + full 16,704-step trains.
-- **Splash Attention and `--matmul-precision=highest` are not jointly supported in jax 0.10.** Splash is integrated (see `scripts/verify_splash.py`) and slightly faster than xla on its own, but combining the two raises a MosaicError. The d24 reference run uses `--attn-impl xla` so HIGHEST can apply globally. Verified numerical agreement between xla and Splash is in `scripts/verify_splash.py`.
-- **muP weight decay scaling.** Upstream nanochat scales `weight_decay` by `sqrt(B/B_REF) * (D_REF/target_tokens)` (see Karpathy `scripts/base_train.py` and `dev/LOG.md` 2026-01-10 entry). The JAX port initially missed this; for d24 it means the configured `--weight-decay=0.28` is automatically rescaled to ~0.042 (×0.151). The scaling is in place; we measured it to be CORE-noise-neutral at d24 (within ±0.003) but kept it because it matches upstream semantics and may matter at other depths.
-- **ClimbMix needs ≥150 shards.** Upstream `dev/LOG.md` 2026-03-04 entry says ~150 shards (~7B tokens) is the minimum for d24 GPT-2 capability. We initially tried 5 shards and got an 80-epoch overfit (val_bpb 1.00, CORE 0.13). All runs above use `python -m nanochat_jax.dataset -n 170` for safety margin.
+Cost calculations use v6e-8 spot as the primary basis. On-demand is listed only as a reference. Price snapshot: 2026-06-04 Google Cloud.
+
+| Platform | Price basis | Hourly |
+|---|---|---:|
+| v6e-8 spot, `us-central1` | 8 TPU chips x `$0.540137/chip-h` | `$4.321096/hr` |
+| 8xH100 spot, GCP Americas | 8 GPUs x `$4.2014/GPU-h`, accelerator only | `~$33.61/hr` |
+| v6e-8 on-demand, `us-central1` | 8 TPU chips x `$2.70/chip-h` | `$21.60/hr` |
+
+Recheck [Google Cloud TPU pricing](https://cloud.google.com/tpu/pricing), [GPU pricing](https://cloud.google.com/compute/gpus-pricing), and [Spot VM pricing notes](https://docs.cloud.google.com/compute/docs/instances/spot#pricing) before budgeting.
+
+For row 1, `16704` steps at `1.58s/step` gives `7.33h`. The spot train estimate is about `$31.7`; the on-demand equivalent is about `$158.4`. The measured spot run stayed within the `$100` TPU budget.
+
+Do not treat sampled CORE (`max_per_task=100`) or `seq_len=4096` / `head_dim=256` probes as nanochat-parity rows.
