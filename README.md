@@ -80,8 +80,10 @@ Use `-i base --model-tag d24_speedrun` to inspect the pretrained base checkpoint
 |-- pyproject.toml
 |-- nanochat_jax/
 |   |-- gpt.py                    # GPT model: XLA + Splash Attention paths
+|   |-- attention.py              # attention backend helpers
 |   |-- optim.py                  # AdamW + Muon
 |   |-- base_train.py             # train_step, schedules, sharded factory
+|   |-- base_train_config.py      # base train config and sizing math
 |   |-- engine.py                 # KV cache + sampling
 |   |-- checkpoint_manager.py     # save / load + optimizer state
 |   |-- common.py                 # cache dir, distributed info, file lock

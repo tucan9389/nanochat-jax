@@ -41,112 +41,22 @@ from nanochat_jax.base_train import ( # noqa: E402 — sys.path mutation above
     make_grad_accum_fns,
     make_train_step_sharded,
 )
+from nanochat_jax.base_train_config import ( # noqa: E402
+    D12_SCALING_PARAMS,
+    compute_batch_lr_scale,
+    compute_total_batch_size_tokens,
+    compute_weight_decay_scaled,
+    make_config,
+    make_d12_config,
+    resolve_num_iterations,
+)
 from nanochat_jax.common import get_base_dir, setup_distributed_env_vars # noqa: E402
-from nanochat_jax.gpt import GPT, GPTConfig # noqa: E402
+from nanochat_jax.gpt import GPT # noqa: E402
 from nanochat_jax.grad_utils import nnx_state_to_flat_dict # noqa: E402
 from nanochat_jax.loss_eval import evaluate_bpb # noqa: E402 —
 from nanochat_jax.perf import compute_mfu, get_peak_bf16_tflops # noqa: E402
 from nanochat_jax.report import log_report_safe # noqa: E402
 from nanochat_jax.sharding import get_process_info, make_mesh # noqa: E402
-
-
-def make_d12_config(
-    *,
-    depth: int = 12,
-    sequence_len: int = 2048,
-    vocab_size: int = 32768,
-    n_head: int = 6,
-    n_kv_head: int = 6,
-    n_embd: int = 768,
-    window_pattern: str = "SSSL",
-    bf16: bool = True,
-    attn_impl: str = "xla",
-    lm_head_precision: str | None = None,
-    splash_block_q: int | None = None,
-    splash_block_kv: int | None = None,
-    splash_block_kv_compute: int | None = None,
-    ve_grad_impl: str = "scatter",
-) -> GPTConfig:
-    """d12 default config (I-02 cascade — §3.11 ).
-
-    Defaults match ``scripts/generate_golden.py:make_d12_real_config``
-    (n_layer=12, MHA, bf16) for downstream BPB / golden comparison.
-
-    **Backward-compat alias** for :func:`make_config` .
-    Direct use is preserved for / regression (n_embd=768 hardcoded).
-    """
-    return GPTConfig(
-        sequence_len=sequence_len,
-        vocab_size=vocab_size,
-        n_layer=depth,
-        n_head=n_head,
-        n_kv_head=n_kv_head,
-        n_embd=n_embd,
-        window_pattern=window_pattern,
-        compute_dtype=jnp.bfloat16 if bf16 else jnp.float32,
-        attn_impl=attn_impl,
-        lm_head_precision=lm_head_precision,
-        splash_block_q=splash_block_q,
-        splash_block_kv=splash_block_kv,
-        splash_block_kv_compute=splash_block_kv_compute,
-        ve_grad_impl=ve_grad_impl,
-    )
-
-
-def make_config(
-    *,
-    depth: int,
-    aspect_ratio: int = 64,
-    head_dim: int = 128,
-    sequence_len: int = 2048,
-    vocab_size: int = 32768,
-    window_pattern: str = "SSSL",
-    bf16: bool = True,
-    attn_impl: str = "xla",
-    lm_head_precision: str | None = None,
-    splash_block_q: int | None = None,
-    splash_block_kv: int | None = None,
-    splash_block_kv_compute: int | None = None,
-    ve_grad_impl: str = "scatter",
-) -> GPTConfig:
-    """ : PT 1:1 mirror of ``nanochat/scripts/base_train.py:build_model_meta``.
-
-    Generalize from :func:`make_d12_config`, supporting any depth with the
-    same ``aspect_ratio`` / ``head_dim`` convention as PT base_train.py:
-
-    - ``base_dim = depth * aspect_ratio``
-    - ``n_embd = ceil(base_dim / head_dim) * head_dim`` (round up to multiple of head_dim)
-    - ``n_head = n_embd // head_dim``
-    - ``n_kv_head = n_head`` (MHA default — PT base_train.py mirror)
-
-    For ``depth=24, aspect_ratio=64, head_dim=128`` (Karpathy d24 default):
-    - ``n_embd = 1536`` (= 24 × 64)
-    - ``n_head = 12`` (= 1536 / 128)
-    - ``n_kv_head = 12`` (MHA)
-    - matches Karpathy LEADERBOARD Run 1 exactly ✅
-
-    For ``depth=12, aspect_ratio=64, head_dim=128`` :
-    - ``n_embd = 768``, ``n_head = 6``, ``n_kv_head = 6`` (defaults preserved).
-    """
-    base_dim = depth * aspect_ratio
-    n_embd = ((base_dim + head_dim - 1) // head_dim) * head_dim
-    n_head = n_embd // head_dim
-    return GPTConfig(
-        sequence_len=sequence_len,
-        vocab_size=vocab_size,
-        n_layer=depth,
-        n_head=n_head,
-        n_kv_head=n_head, # MHA — PT base_train.py mirror
-        n_embd=n_embd,
-        window_pattern=window_pattern,
-        compute_dtype=jnp.bfloat16 if bf16 else jnp.float32,
-        attn_impl=attn_impl,
-        lm_head_precision=lm_head_precision,
-        splash_block_q=splash_block_q,
-        splash_block_kv=splash_block_kv,
-        splash_block_kv_compute=splash_block_kv_compute,
-        ve_grad_impl=ve_grad_impl,
-    )
 
 
 def make_synthetic_batch(
@@ -633,27 +543,29 @@ def main() -> int:
     # 4. total_batch_size + Karpathy-style LR/WD muP scaling → param_groups + optim_state
     # Batch size must be known before optimizer init (weight decay depends on it).
     grad_accum_steps = max(int(args.grad_accum_steps), 1)
-    if args.total_batch_size > 0:
-        total_batch_size_tokens = int(args.total_batch_size)
-    else:
-        total_batch_size_tokens = (
-            args.device_batch_size * args.seq_len
-            * max(jax.device_count(), 1) * grad_accum_steps
-        )
+    total_batch_size_tokens = compute_total_batch_size_tokens(
+        total_batch_size=args.total_batch_size,
+        device_batch_size=args.device_batch_size,
+        seq_len=args.seq_len,
+        device_count=jax.device_count(),
+        grad_accum_steps=grad_accum_steps,
+    )
 
     # Karpathy muP scaling (PT base_train.py:287-315):
     # batch_lr_scale = sqrt(B / B_ref) — η ∝ √(B/B_ref) for AdamW/Muon
     # weight_decay_scaled = wd × sqrt(B/B_ref) × (D_ref / D_target)
     # where D_ref/D_target = d12_scaling_params / d_X_scaling_params (ratio cancels)
     # This uses the T_epoch framework: λ ∝ √(B/B_ref) × (D_ref/D).
-    _B_REF = 2**19 # 524288 tokens — Karpathy muP reference batch
     _scaling_counts = model.num_scaling_params()
     _d_x_scaling = _scaling_counts["transformer_matrices"] + _scaling_counts["lm_head"]
     # Standard d12 reference (depth=12, aspect_ratio=64, head_dim=128, vocab=32768):
     # transformer_matrices=84,935,088 + lm_head=25,165,824 = 110,100,912
-    _D12_SCALING = 110_100_912
-    _batch_lr_scale = (total_batch_size_tokens / _B_REF) ** 0.5
-    weight_decay_scaled = args.weight_decay * _batch_lr_scale * (_D12_SCALING / _d_x_scaling)
+    _batch_lr_scale = compute_batch_lr_scale(total_batch_size_tokens)
+    weight_decay_scaled = compute_weight_decay_scaled(
+        weight_decay=args.weight_decay,
+        total_batch_size_tokens=total_batch_size_tokens,
+        d_x_scaling_params=_d_x_scaling,
+    )
 
     n_params = None
     if is_master:
@@ -670,7 +582,7 @@ def main() -> int:
         print(
             f"[info] muP scaling: batch_lr_scale={_batch_lr_scale:.4f} "
             f"weight_decay {args.weight_decay:.5f} → {weight_decay_scaled:.5f} "
-            f"(×{_D12_SCALING / _d_x_scaling:.4f} d12/model ratio)"
+            f"(×{D12_SCALING_PARAMS / _d_x_scaling:.4f} d12/model ratio)"
         )
 
     polar_express_dtype = (
@@ -691,25 +603,12 @@ def main() -> int:
     )
 
     # + : compute num_iterations (total_batch_size already above)
-    if int(args.num_iterations) > 0:
-        num_iterations = int(args.num_iterations)
-        horizon_source = "explicit --num-iterations"
-    elif args.target_param_data_ratio > 0:
-        scaling_params = (
-            model.num_scaling_params()["transformer_matrices"]
-            + model.num_scaling_params()["lm_head"]
-        )
-        target_tokens = int(args.target_param_data_ratio * scaling_params)
-        num_iterations = target_tokens // total_batch_size_tokens
-        horizon_source = (
-            f"--target-param-data-ratio={args.target_param_data_ratio} "
-            f"(target_tokens={target_tokens:,}, scaling_params={scaling_params:,})"
-        )
-    else:
-        # Backward-compat: default num_iterations was 100 (overridden by
-        # --num-iterations arg historically)
-        num_iterations = 100
-        horizon_source = "default 100 "
+    num_iterations, horizon_source = resolve_num_iterations(
+        num_iterations=args.num_iterations,
+        target_param_data_ratio=args.target_param_data_ratio,
+        scaling_params=_d_x_scaling,
+        total_batch_size_tokens=total_batch_size_tokens,
+    )
 
     if is_master:
         print(
