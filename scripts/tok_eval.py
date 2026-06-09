@@ -2,6 +2,7 @@
 
 from nanochat_jax.tokenizer import get_tokenizer, RustBPETokenizer
 from nanochat_jax.dataset import parquets_iter_batched
+from nanochat_jax.report import log_report_safe
 
 # Random text I got from a random website this morning
 news_text = r"""
@@ -183,3 +184,31 @@ def print_comparison(baseline_name, baseline_results, ours_results, all_text):
 # Print comparisons
 print_comparison("GPT-2", tokenizer_results['gpt2'], tokenizer_results['ours'], all_text)
 print_comparison("GPT-4", tokenizer_results['gpt4'], tokenizer_results['ours'], all_text)
+
+report_lines = []
+for baseline_name in ["GPT-2", "GPT-4"]:
+    baseline_key = baseline_name.lower().replace("-", "")
+    baseline_results = tokenizer_results[baseline_key]
+    ours_results = tokenizer_results["ours"]
+    report_lines.extend([
+        f"### Comparison with {baseline_name}",
+        "",
+        f"| Text Type | Bytes | {baseline_name} Tokens | {baseline_name} Ratio | Ours Tokens | Ours Ratio | Relative Diff % |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ])
+    for name, _text in all_text:
+        baseline_data = baseline_results[name]
+        ours_data = ours_results[name]
+        relative_diff = (
+            (baseline_data["tokens"] - ours_data["tokens"])
+            / baseline_data["tokens"]
+        ) * 100
+        report_lines.append(
+            f"| {name} | {baseline_data['bytes']} | "
+            f"{baseline_data['tokens']} | {baseline_data['ratio']:.2f} | "
+            f"{ours_data['tokens']} | {ours_data['ratio']:.2f} | "
+            f"{relative_diff:+.1f}% |"
+        )
+    report_lines.append("")
+
+log_report_safe(section="Tokenizer evaluation", data=["\n".join(report_lines)])

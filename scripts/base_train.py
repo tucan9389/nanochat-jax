@@ -46,6 +46,7 @@ from nanochat_jax.gpt import GPT, GPTConfig # noqa: E402
 from nanochat_jax.grad_utils import nnx_state_to_flat_dict # noqa: E402
 from nanochat_jax.loss_eval import evaluate_bpb # noqa: E402 —
 from nanochat_jax.perf import compute_mfu, get_peak_bf16_tflops # noqa: E402
+from nanochat_jax.report import log_report_safe # noqa: E402
 from nanochat_jax.sharding import get_process_info, make_mesh # noqa: E402
 
 
@@ -206,10 +207,9 @@ def _rolling_delete_old_checkpoints(
 
     Looks for ``model_<step:06d>.pt`` files in ``checkpoint_dir`` and removes
     the oldest, keeping ``keep_last`` newest. Also removes corresponding
-    ``meta_<step:06d>.json``. Idempotent — no-op if fewer than ``keep_last``.
-
-    Per OPERATIONAL-TRAPS T06 cookbook (work 0036). Master-only call.
-    Defensive against concurrent deletion races (OSError → continue).
+    ``meta_<step:06d>.json`` and ``optim_<step:06d>_rank*.pt`` files.
+    Idempotent: no-op if fewer than ``keep_last``. Master-only call.
+    Defensive against concurrent deletion races (OSError -> continue).
 
     Returns:
         Number of checkpoint pairs deleted.
@@ -237,6 +237,16 @@ def _rolling_delete_old_checkpoints(
         if os.path.exists(meta_path):
             try:
                 os.remove(meta_path)
+            except OSError:
+                pass
+        optim_prefix = f"optim_{_step:06d}_rank"
+        for optim_fname in os.listdir(checkpoint_dir):
+            if not optim_fname.startswith(optim_prefix):
+                continue
+            if not optim_fname.endswith(".pt"):
+                continue
+            try:
+                os.remove(os.path.join(checkpoint_dir, optim_fname))
             except OSError:
                 pass
         deleted += 1
@@ -645,6 +655,7 @@ def main() -> int:
     _batch_lr_scale = (total_batch_size_tokens / _B_REF) ** 0.5
     weight_decay_scaled = args.weight_decay * _batch_lr_scale * (_D12_SCALING / _d_x_scaling)
 
+    n_params = None
     if is_master:
         n_params = sum(int(np.prod(v.shape)) for v in nnx_state_to_flat_dict(nnx.state(model, nnx.Param)).values())
         print(f"[info] model params (Param leaves) = {n_params:,} ({n_params / 1e6:.2f}M)")
@@ -710,10 +721,9 @@ def main() -> int:
 
     # 5. Mesh + sharded train_step factory
     mesh = make_mesh() # default: jax.device_count
-    # v4 (work 0036): register mesh for Splash multi-chip shard_map.
-    # Must be set BEFORE jit-tracing the train_step so the mesh is captured
-    # as a closed-over constant. ``set_splash_mesh(None)`` is a no-op for the
-    # default ``attn_impl='xla'`` path.
+    # Register the mesh before jit-tracing the train_step so Splash Attention
+    # can capture the multi-chip shard_map mesh as a closed-over constant.
+    # ``set_splash_mesh(None)`` is a no-op for the default ``attn_impl='xla'``.
     if args.attn_impl == "splash":
         from nanochat_jax.gpt import set_splash_mesh
         set_splash_mesh(mesh)
@@ -812,6 +822,22 @@ def main() -> int:
                 "[dry-run] All init complete (mesh, model, optim, dataloader). "
                 "Exiting before the training loop."
             )
+            log_report_safe(
+                section="Base model training",
+                data=[
+                    vars(args),
+                    {
+                        "dry_run": True,
+                        "Number of parameters": n_params,
+                        "Calculated number of iterations": num_iterations,
+                        "Number of training tokens": total_batch_size_tokens * num_iterations,
+                        "Total batch size": total_batch_size_tokens,
+                        "JAX world size": int(jax.process_count()),
+                        "JAX device count": int(jax.device_count()),
+                        "checkpoint_dir": None,
+                    },
+                ],
+            )
         return 0
     losses: list[float] = []
     t0 = time.time()
@@ -868,12 +894,9 @@ def main() -> int:
                 "Optimizer checkpoint is required for --resume-from-step but "
                 f"was not found for rank {process_idx} at step {args.resume_from_step}"
             )
-        # Inject PT state_dict into NNX model (T07 fix per OPERATIONAL-TRAPS,
-        # work 0037 Phase 0b). `inject_pt_linear_weight` is a single-Linear
-        # helper, NOT a full-GPT injector — calling it on a GPT + dict raises
-        # AttributeError at weight_converter.py:_torch_to_numpy. Use the public
-        # `inject_pt_state_dict` from checkpoint_manager ( cascade verified
-        # NNX `tree_flatten_with_path` + `nnx.update` path).
+        # Inject the PyTorch-style state_dict into the NNX model. The linear
+        # layer helper is intentionally not used here; full-model injection goes
+        # through checkpoint_manager so GPT module paths are mapped correctly.
         from nanochat_jax.checkpoint_manager import inject_pt_state_dict
         from nanochat_jax.weight_converter import pt_state_dict_to_jax
         jax_dict = pt_state_dict_to_jax(model_data, target_dtype=None)
@@ -962,9 +985,9 @@ def main() -> int:
         meta = {
             "step": step,
             "val_bpb": val_bpb,
-            # T14 fix per OPERATIONAL-TRAPS (work 0036): model_config dict for
-            # downstream consumers (base_eval, chat_cli, v5 resume).
-            # Karpathy 1:1 mirror — see external/nanochat/scripts/base_train.py:486
+            # model_config dict for downstream consumers such as base_eval,
+            # chat_cli, and resume paths. Karpathy 1:1 mirror:
+            # external/nanochat/scripts/base_train.py:486
             # `meta={"model_config": model_config_kwargs, ...}`.
             # compute_dtype + attn_impl omitted intentionally — set explicitly
             # at load. Backward-compat: deconstructed
@@ -1023,10 +1046,8 @@ def main() -> int:
         )
         if is_master:
             print(f"[info] Saved intermediate checkpoint at step {step}")
-            # T06 fix per OPERATIONAL-TRAPS (work 0036) — rolling delete
-            # to prevent disk full on long-running spot training. v4
-            # cascade hit 16 ckpts × 5.5GB = 88GB / 100GB worker disk →
-            # torch.save fail @ step 8000. keep_last=2 = ~11GB max disk.
+            # Keep only the newest local checkpoints so long spot runs do not
+            # fill the TPU VM boot disk. Durable copies should be synced to GCS.
             keep_last = max(int(getattr(args, "keep_last_checkpoints", 2)), 1)
             deleted = _rolling_delete_old_checkpoints(
                 checkpoint_dir, keep_last=keep_last
@@ -1216,10 +1237,9 @@ def main() -> int:
             _save_intermediate_checkpoint(step, val_bpb=None)
 
         # 7h. : periodic val_bpb measurement AFTER checkpoint save.
-        # NOTE (work 0036 Phase 6 cascade): initial eval at step 0 triggers a
-        # massive JIT compile (~50min for d24+B=8+Splash+multi-host) since the
-        # eval graph is structurally different from the train graph. Skip eval
-        # at step 0 — the first eval lands at step==eval_every.
+        # Initial eval at step 0 triggers a large JIT compile because the eval
+        # graph is structurally different from the train graph. Skip eval at
+        # step 0; the first eval lands at step == eval_every.
         # --no-final-eval suppresses the is_last_step branch only; if last step
         # happens to align with the periodic schedule, that path still fires.
         val_bpb_periodic = None
@@ -1266,9 +1286,10 @@ def main() -> int:
 
     if is_master and num_iter > 0:
         elapsed = time.time() - t0
+        executed_steps = len(losses)
         print(
-            f"[done] {num_iter} steps in {elapsed:.1f}s "
-            f"(avg {elapsed / max(num_iter, 1):.3f}s/step)"
+            f"[done] {executed_steps} executed steps in {elapsed:.1f}s "
+            f"(avg {elapsed / max(executed_steps, 1):.3f}s/step)"
         )
         print(f"[done] losses[:5] = {losses[:5]}")
         print(f"[done] losses[-5:] = {losses[-5:]}")
@@ -1277,6 +1298,7 @@ def main() -> int:
     # 9. : val BPB measurement (M7 trigger). Runs on master + all hosts;
     # ``evaluate_bpb`` does the cross-host all-reduce internally
     # (loss_eval.py:196+). PT mirror: base_train.py:421-435 final eval.
+    final_bpb_report = None
     if args.bpb_out is not None:
         per_process_val_batch = args.device_batch_size * max(local_device_count, 1)
         val_loader = tokenizing_distributed_data_loader_bos_bestfit(
@@ -1312,13 +1334,71 @@ def main() -> int:
                 "device_count": int(jax.device_count()),
                 "use_real_data": bool(args.use_real_data),
                 "eval_only": bool(args.eval_only),
-                "wall_time_train_s": (time.time() - t0 - eval_elapsed) if num_iter > 0 else 0.0,
+                "resume_from_step": (
+                    int(args.resume_from_step)
+                    if int(args.resume_from_step) >= 0
+                    else None
+                ),
+                "start_step": int(start_step),
+                "executed_steps_this_process": len(losses),
+                "wall_time_train_s": (time.time() - t0 - eval_elapsed) if losses else 0.0,
                 "wall_time_eval_s": eval_elapsed,
                 "final_train_loss": losses[-1] if losses else None,
             }
             with open(args.bpb_out, "w") as f:
                 json.dump(result, f, indent=2)
             print(f"[info] Saved val BPB result to {args.bpb_out}")
+            final_bpb_report = result
+
+    if is_master:
+        total_elapsed = time.time() - t0
+        executed_steps = len(losses)
+        last_completed_step = start_step + executed_steps - 1 if executed_steps else start_step - 1
+        represented_steps = max(last_completed_step + 1, 0)
+        report_setup = {
+            "dry_run": False,
+            "model_tag": model_tag,
+            "checkpoint_dir": checkpoint_dir,
+            "Number of parameters": n_params,
+            "Number of FLOPs per token": f"{num_flops_per_token:e}",
+            "Calculated number of iterations": num_iterations,
+            "Resume from step": (
+                int(args.resume_from_step)
+                if int(args.resume_from_step) >= 0
+                else None
+            ),
+            "Start step": start_step,
+            "Last completed step": last_completed_step,
+            "Executed number of iterations": executed_steps,
+            "Total model iterations represented": represented_steps,
+            "Training tokens executed this process": total_batch_size_tokens * executed_steps,
+            "Training tokens represented by checkpoint": total_batch_size_tokens * represented_steps,
+            "Tokens : Scaling params ratio": (
+                (total_batch_size_tokens * represented_steps) / _d_x_scaling
+                if _d_x_scaling
+                else None
+            ),
+            "JAX world size": int(jax.process_count()),
+            "JAX device count": int(jax.device_count()),
+            "warmup_steps": args.warmup_steps,
+            "warmdown_ratio": args.warmdown_ratio,
+            "final_lr_frac": args.final_lr_frac,
+        }
+        report_outcome = {
+            "Final train loss": losses[-1] if losses else None,
+            "Total training time s": total_elapsed,
+            "Average step time s": (
+                total_elapsed / max(executed_steps, 1)
+                if executed_steps
+                else None
+            ),
+        }
+        if final_bpb_report is not None:
+            report_outcome["Final validation bpb"] = final_bpb_report.get("val_bpb")
+        log_report_safe(
+            section="Base model training",
+            data=[vars(args), report_setup, report_outcome],
+        )
 
     return 0
 

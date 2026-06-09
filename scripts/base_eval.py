@@ -52,6 +52,7 @@ from nanochat_jax.common import (  # noqa: E402
 )
 from nanochat_jax.engine import Engine  # noqa: E402
 from nanochat_jax.loss_eval import evaluate_bpb  # noqa: E402
+from nanochat_jax.report import log_report_safe  # noqa: E402
 
 # PT mirror: nanochat/scripts/base_eval.py:92 (S3 bundle URL, Karpathy public)
 _EVAL_BUNDLE_URL = "https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip"
@@ -123,8 +124,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default="base",
         choices=["base", "sft", "rl"],
         help=(
-            "Source of the model: base|sft|rl. Default 'base' (JAX-port "
-            "SFT and RL paths not yet ported)"
+            "Source of the model: base|sft|rl. Default 'base'. "
+            "RL loading is reserved for a future port."
         ),
     )
     # PT mirror: --model-tag, --step
@@ -796,6 +797,27 @@ def _write_results_json(
     _print0(f"\n[info] Saved results to: {out_path}")
 
 
+def prepare_model_for_base_eval(model) -> bool:
+    """Use eval-safe attention kernels for base model evaluation.
+
+    Splash Attention is the TPU training kernel and requires query lengths to
+    be block-size multiples. Base BPB may use full training sequence length, but
+    CORE and sampling evaluate shorter prompts, so switch Splash checkpoints to
+    XLA attention at runtime. Weights and checkpoint metadata are unchanged.
+    """
+    switched = False
+    if getattr(model.config, "attn_impl", "xla") == "splash":
+        model.config.attn_impl = "xla"
+        switched = True
+    transformer = getattr(model, "transformer", None)
+    for block in getattr(transformer, "h", []):
+        attn = getattr(block, "attn", None)
+        if getattr(attn, "attn_impl", "xla") == "splash":
+            attn.attn_impl = "xla"
+            switched = True
+    return switched
+
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
@@ -864,6 +886,8 @@ def main(argv: list[str] | None = None) -> int:
         base_dir=args.base_dir,
     )
     t_load = time.time() - t_load_start
+    if prepare_model_for_base_eval(model):
+        _print0("Using XLA attention for base_eval variable-length prompts")
 
     sequence_len = meta["model_config"]["sequence_len"]
     model_name = f"base_model (step {meta['step']})"
@@ -927,6 +951,33 @@ def main(argv: list[str] | None = None) -> int:
             get_base_dir(), "base_eval", f"{model_slug}.csv"
         )
         _write_core_csv(csv_out_path, core_results)
+
+    if _is_master():
+        report_summary = {
+            "model": model_name,
+            "source": args.source,
+            "model_tag": args.model_tag,
+            "requested_step": args.step,
+            "resolved_step": meta.get("step"),
+            "wall_time_s": elapsed,
+            "load_time_s": t_load,
+        }
+        if core_results is not None:
+            report_summary["CORE metric"] = core_results["core_metric"]
+        if bpb_results:
+            report_summary["train bpb"] = bpb_results.get("train")
+            report_summary["val bpb"] = bpb_results.get("val")
+        report_data = [report_summary]
+        if core_results is not None:
+            report_data.append({"CORE centered results": core_results["centered_results"]})
+        if samples:
+            report_data.append({f"sample {i}": sample for i, sample in enumerate(samples)})
+        if unconditioned_samples:
+            report_data.append({
+                f"unconditioned sample {i}": sample
+                for i, sample in enumerate(unconditioned_samples)
+            })
+        log_report_safe(section="Base model evaluation", data=report_data)
 
     # 9. Cleanup
     return 0

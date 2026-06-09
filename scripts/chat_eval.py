@@ -11,7 +11,10 @@ Example runs::
 from __future__ import annotations
 
 import argparse
+import json
+import os
 from functools import partial
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -20,6 +23,13 @@ from jax.experimental import multihost_utils
 from nanochat_jax.checkpoint_manager import load_model
 from nanochat_jax.common import setup_distributed_env_vars
 from nanochat_jax.engine import Engine
+from nanochat_jax.report import log_report_safe
+
+_DTYPE_MAP = {
+    "float32": jnp.float32,
+    "bfloat16": jnp.bfloat16,
+    "float16": jnp.float16,
+}
 
 # -----------------------------------------------------------------------------
 # Helpers (master-only printing, distributed sum reduce)
@@ -63,6 +73,7 @@ def run_generative_eval(
     temperature: float,
     top_k: int,
     max_problems: int | None = None,
+    start_index: int = 0,
 ):
     """Sample completions and evaluate via ``task_object.evaluate``.
 
@@ -72,12 +83,14 @@ def run_generative_eval(
     process_count = max(jax.process_count(), 1)
     process_idx = jax.process_index()
 
-    num_problems = (
-        len(task_object) if max_problems is None else min(len(task_object), max_problems)
+    stop_index = (
+        len(task_object)
+        if max_problems is None
+        else min(len(task_object), start_index + max_problems)
     )
 
     num_passed, total = 0, 0
-    for i in range(process_idx, num_problems, process_count):
+    for i in range(start_index + process_idx, stop_index, process_count):
         conversation = task_object[i]
 
         # Tokenize the prompt
@@ -137,6 +150,7 @@ def run_categorical_eval(
     model,
     batch_size: int,
     max_problems: int | None = None,
+    start_index: int = 0,
 ):
     """Argmax over the available answer letters in a single forward pass.
 
@@ -148,9 +162,12 @@ def run_categorical_eval(
     process_idx = jax.process_index()
     bos = tokenizer.get_bos_token_id()  # use BOS as pad token (positions ignored)
 
-    num_problems = (
-        len(task_object) if max_problems is None else min(len(task_object), max_problems)
+    stop_index = (
+        len(task_object)
+        if max_problems is None
+        else min(len(task_object), start_index + max_problems)
     )
+    num_problems = max(stop_index - start_index, 0)
 
     def ceil_div(x: int, y: int) -> int:
         return -(-x // y)
@@ -161,27 +178,43 @@ def run_categorical_eval(
     letter_to_id_cache: dict[str, int] = {}
     num_passed, total = 0, 0
 
+    # Tokenize once and pad all categorical batches to one task-level static
+    # shape. Otherwise JAX recompiles for many per-batch prompt lengths.
+    conversations_all = [task_object[ii] for ii in range(start_index, stop_index)]
+    prompt_ids_all = [
+        tokenizer.render_for_completion(conversation)
+        for conversation in conversations_all
+    ]
+    if prompt_ids_all:
+        fixed_length = max(len(ids) for ids in prompt_ids_all)
+    else:
+        fixed_length = 1
+    _print0(
+        f"Categorical eval static shape: batches={num_batches}, "
+        f"batch_size={batch_size}, prompt_length={fixed_length}"
+    )
+
     for i in range(process_idx, num_batches, process_count):
         i0, i1 = i * batch_size, min((i + 1) * batch_size, num_problems)
+        real_count = i1 - i0
 
         # Prepare the batch — pad/collate variable-length prompts
-        conversations = [task_object[ii] for ii in range(i0, i1)]
-        prompt_ids_list = [
-            tokenizer.render_for_completion(conversation) for conversation in conversations
-        ]
-        max_length = max(len(ids) for ids in prompt_ids_list)
+        conversations = conversations_all[i0:i1]
+        prompt_ids_list = prompt_ids_all[i0:i1]
         # Position of the last token (predicted answer position)
         answer_time_positions = [len(ids) - 1 for ids in prompt_ids_list]
         padded_prompt_ids = [
-            ids + [bos] * (max_length - len(ids)) for ids in prompt_ids_list
+            ids + [bos] * (fixed_length - len(ids)) for ids in prompt_ids_list
         ]
+        while len(padded_prompt_ids) < batch_size:
+            padded_prompt_ids.append([bos] * fixed_length)
         prompt_ids = jnp.asarray(padded_prompt_ids, dtype=jnp.int32)
 
         # Forward pass
         logits = model(prompt_ids)  # (B, T, V)
 
         # Narrow logits to the available answer letters of each problem
-        for idx, conversation in enumerate(conversations):
+        for idx, conversation in enumerate(conversations[:real_count]):
             letters = conversation["letters"]
             letter_ids = []
             for letter in letters:
@@ -197,6 +230,8 @@ def run_categorical_eval(
             outcome = task_object.evaluate(conversation, predicted_letter)
             num_passed += int(outcome)
             total += 1
+        if (i - process_idx + process_count) % (25 * process_count) == 0:
+            _print0(f"Categorical progress: {min(i1, num_problems)}/{num_problems}")
 
     # Aggregate results across all processes
     num_passed = _all_reduce_sum(num_passed)
@@ -256,6 +291,7 @@ def run_chat_eval(
     temperature: float = 0.0,
     top_k: int = 50,
     max_problems: int | None = None,
+    start_index: int = 0,
 ):
     """Build the task object and dispatch to the right eval loop."""
     task_module = _build_task_module(task_name)
@@ -271,10 +307,16 @@ def run_chat_eval(
             temperature,
             top_k,
             max_problems=max_problems,
+            start_index=start_index,
         )
     elif task_object.eval_type == "categorical":
         acc = run_categorical_eval(
-            task_object, tokenizer, model, batch_size, max_problems=max_problems
+            task_object,
+            tokenizer,
+            model,
+            batch_size,
+            max_problems=max_problems,
+            start_index=start_index,
         )
     else:
         raise ValueError(f"Unsupported task evaluation type: {task_object.eval_type}")
@@ -370,11 +412,24 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("-s", "--step", type=int, default=None, help="Step to load")
     parser.add_argument(
+        "--dtype",
+        type=str,
+        default="float32",
+        choices=sorted(_DTYPE_MAP),
+        help="Compute dtype for the loaded model. TPU production runs should use bfloat16.",
+    )
+    parser.add_argument(
         "-x",
         "--max-problems",
         type=int,
         default=None,
         help="Max problems to evaluate per task (None = all)",
+    )
+    parser.add_argument(
+        "--start-index",
+        type=int,
+        default=0,
+        help="First problem index to evaluate within each task (default: 0).",
     )
     parser.add_argument(
         "--device-type",
@@ -383,19 +438,87 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["cuda", "cpu", "mps", ""],
         help="Device type (PT compatibility — JAX-port is device-agnostic, ignored)",
     )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help="Optional JSON output path for task accuracies and ChatCORE.",
+    )
     return parser
+
+
+def build_result_report(
+    *,
+    args: argparse.Namespace,
+    meta: dict[str, Any],
+    task_names: list[str],
+    results: dict[str, float],
+    chatcore_dict: dict[str, float],
+) -> dict[str, Any]:
+    """Build a stable JSON-serializable chat_eval result payload."""
+    return {
+        "source": args.source,
+        "model_tag": args.model_tag,
+        "requested_step": args.step,
+        "resolved_step": meta.get("step"),
+        "dtype": getattr(args, "dtype", "float32"),
+        "model_config": meta.get("model_config", {}),
+        "tasks": task_names,
+        "results": results,
+        "chatcore": chatcore_dict.get("ChatCORE metric"),
+        "chatcore_dict": chatcore_dict,
+        "args": vars(args).copy(),
+    }
+
+
+def write_result_report(path: str, report: dict[str, Any]) -> None:
+    """Write chat_eval JSON report, creating parent directories if needed."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def prepare_model_for_chat_eval(model) -> bool:
+    """Use variable-length-safe attention kernels for ChatEval.
+
+    Splash Attention requires query lengths to be block-size multiples and is
+    mainly a training/prefill throughput kernel. ChatEval uses variable-length
+    prompts, so switch splash checkpoints to XLA attention at runtime. The
+    weights and checkpoint metadata are unchanged.
+    """
+    switched = False
+    if getattr(model.config, "attn_impl", "xla") == "splash":
+        model.config.attn_impl = "xla"
+        switched = True
+    transformer = getattr(model, "transformer", None)
+    for block in getattr(transformer, "h", []):
+        attn = getattr(block, "attn", None)
+        if getattr(attn, "attn_impl", "xla") == "splash":
+            attn.attn_impl = "xla"
+            switched = True
+    return switched
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.start_index < 0:
+        raise ValueError("--start-index must be non-negative")
 
     # Setup distributed env vars
     setup_distributed_env_vars()
 
     # Load the model
-    model, tokenizer, _meta = load_model(
-        args.source, model_tag=args.model_tag, step=args.step
+    model, tokenizer, meta = load_model(
+        args.source,
+        compute_dtype=_DTYPE_MAP[args.dtype],
+        model_tag=args.model_tag,
+        step=args.step,
     )
+    if prepare_model_for_chat_eval(model):
+        _print0("Using XLA attention for ChatEval variable-length prompts")
     engine = Engine(model, tokenizer)
 
     # Determine the tasks to evaluate
@@ -417,6 +540,7 @@ def main(argv: list[str] | None = None) -> int:
             temperature=args.temperature,
             top_k=args.top_k,
             max_problems=args.max_problems,
+            start_index=args.start_index,
         )
         results[task_name] = acc
         _print0(f"{task_name} accuracy: {100 * acc:.2f}%")
@@ -437,6 +561,39 @@ def main(argv: list[str] | None = None) -> int:
                 "ChatCORE metric: not computed (requires all 6 tasks; use --task-name with | "
                 "to evaluate multiple)"
             )
+        if args.out:
+            report = build_result_report(
+                args=args,
+                meta=meta,
+                task_names=task_names,
+                results=results,
+                chatcore_dict=chatcore_dict,
+            )
+            write_result_report(args.out, report)
+            print(f"Wrote JSON results: {args.out}")
+        report_summary = {
+            "source": args.source,
+            "model_tag": args.model_tag,
+            "requested_step": args.step,
+            "resolved_step": meta.get("step"),
+            "dtype": args.dtype,
+            "task_name": args.task_name or "all",
+            "max_problems": args.max_problems,
+            "max_new_tokens": args.max_new_tokens,
+            "num_samples": args.num_samples,
+            "batch_size": args.batch_size,
+            "protocol": (
+                "full_all_tasks"
+                if args.task_name is None and args.max_problems is None
+                else "partial_or_capped"
+            ),
+        }
+        report_summary.update(results)
+        report_summary.update(chatcore_dict)
+        log_report_safe(
+            section=f"Chat evaluation {args.source}",
+            data=[vars(args), report_summary],
+        )
 
     return 0
 

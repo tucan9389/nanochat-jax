@@ -10,8 +10,8 @@ Scopes (``--sft-scope``):
   SimpleSpelling + SpellingBee (~1M rows). Mirrors upstream nanochat.
 - ``reduced``: smaller subsets of the above (~150K rows) for cheaper TPU runs.
 - ``min``: ~12K rows for Mac CPU sanity.
-- ``identity-only``: legacy 2K rows; produces catastrophic forgetting and is
-  kept only for backward compatibility.
+- ``identity-only``: legacy 2K rows; kept only for backward compatibility and
+  not recommended for public quality runs.
 
 Usage::
 
@@ -32,6 +32,7 @@ import logging
 import os
 import sys
 import time
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING
 
 import jax
@@ -45,6 +46,7 @@ if _ROOT not in sys.path:
 
 from nanochat_jax.base_train import ( # noqa: E402 — sys.path mutation above
     init_train_state,
+    make_grad_accum_fns,
     make_train_step_sharded,
 )
 from nanochat_jax.checkpoint_manager import ( # noqa: E402
@@ -58,6 +60,7 @@ from nanochat_jax.common import ( # noqa: E402
     setup_distributed_env_vars,
 )
 from nanochat_jax.loss_eval import evaluate_bpb # noqa: E402
+from nanochat_jax.report import log_report_safe # noqa: E402
 from nanochat_jax.sharding import make_mesh # noqa: E402
 from nanochat_jax.tasks import CustomJSON, SmolTalk, TaskMixture # noqa: E402
 from nanochat_jax.tasks.gsm8k import GSM8K # noqa: E402 — lazy path
@@ -72,7 +75,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Identity conversations URL (PT 1:1 — auto-download cascade)
+# Identity conversations URL (PT 1:1 auto-download path)
 IDENTITY_CONVERSATIONS_URL = (
     "https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl"
 )
@@ -106,6 +109,36 @@ def _print0(message: str) -> None:
     """Master-only print ."""
     if jax.process_index() == 0:
         print(message, flush=True)
+
+
+def capture_attention_impl_state(model) -> list[tuple[object, str, object]]:
+    """Capture attention impl fields that ChatEval may need to switch to XLA."""
+    state: list[tuple[object, str, object]] = []
+    config = getattr(model, "config", None)
+    if config is not None and hasattr(config, "attn_impl"):
+        state.append((config, "attn_impl", getattr(config, "attn_impl")))
+
+    transformer = getattr(model, "transformer", None)
+    for block in getattr(transformer, "h", []):
+        attn = getattr(block, "attn", None)
+        if attn is not None and hasattr(attn, "attn_impl"):
+            state.append((attn, "attn_impl", getattr(attn, "attn_impl")))
+    return state
+
+
+def set_attention_impl_for_chat_eval(model) -> list[tuple[object, str, object]]:
+    """Temporarily use XLA attention for variable-length ChatCORE prompts."""
+    state = capture_attention_impl_state(model)
+    for obj, attr, old_value in state:
+        if old_value == "splash":
+            setattr(obj, attr, "xla")
+    return state
+
+
+def restore_attention_impl_state(state: list[tuple[object, str, object]]) -> None:
+    """Restore attention impl fields captured by ``set_attention_impl_for_chat_eval``."""
+    for obj, attr, old_value in state:
+        setattr(obj, attr, old_value)
 
 
 # -----------------------------------------------------------------------------
@@ -153,6 +186,91 @@ def get_muon_momentum_sft(it: int) -> float:
     """
     frac = min(it / 300, 1)
     return (1 - frac) * 0.85 + frac * 0.95
+
+
+# -----------------------------------------------------------------------------
+# Batch semantics
+# -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BatchSemantics:
+    """Resolved SFT batch math.
+
+    ``device_batch_size`` is per accelerator device. The dataloader emits
+    ``per_process_batch_size`` rows, because a single JAX process owns
+    ``local_device_count`` devices on single-host TPU slices such as v6e-8.
+    """
+
+    device_batch_size: int
+    max_seq_len: int
+    total_batch_size: int
+    per_process_batch_size: int
+    process_count: int
+    local_device_count: int
+    device_count: int
+    tokens_per_microbatch_per_device: int
+    tokens_per_microbatch_per_process: int
+    world_tokens_per_microbatch: int
+    grad_accum_steps: int
+
+
+def resolve_batch_semantics(
+    *,
+    device_batch_size: int,
+    max_seq_len: int,
+    total_batch_size: int | None,
+    process_count: int,
+    local_device_count: int,
+    device_count: int,
+) -> BatchSemantics:
+    """Resolve nanochat SFT batch accounting.
+
+    The upstream token batch is per-device rows x sequence length x all devices
+    x gradient accumulation. Using only ``jax.process_count()`` is wrong on
+    single-host multi-chip TPU slices, where ``process_count == 1`` but
+    ``device_count`` can be 8.
+    """
+    if device_batch_size <= 0:
+        raise ValueError("device_batch_size must be positive")
+    if max_seq_len <= 0:
+        raise ValueError("max_seq_len must be positive")
+
+    process_count = max(int(process_count), 1)
+    local_device_count = max(int(local_device_count), 1)
+    device_count = max(int(device_count), 1)
+
+    per_process_batch_size = device_batch_size * local_device_count
+    tokens_per_microbatch_per_device = device_batch_size * max_seq_len
+    tokens_per_microbatch_per_process = per_process_batch_size * max_seq_len
+    world_tokens_per_microbatch = tokens_per_microbatch_per_device * device_count
+
+    if total_batch_size is None:
+        total_batch_size = world_tokens_per_microbatch
+    else:
+        total_batch_size = int(total_batch_size)
+        if total_batch_size <= 0:
+            total_batch_size = world_tokens_per_microbatch
+
+    if total_batch_size % world_tokens_per_microbatch != 0:
+        grad_accum_steps = max(1, total_batch_size // world_tokens_per_microbatch)
+        total_batch_size = grad_accum_steps * world_tokens_per_microbatch
+    else:
+        grad_accum_steps = total_batch_size // world_tokens_per_microbatch
+
+    return BatchSemantics(
+        device_batch_size=device_batch_size,
+        max_seq_len=max_seq_len,
+        total_batch_size=total_batch_size,
+        per_process_batch_size=per_process_batch_size,
+        process_count=process_count,
+        local_device_count=local_device_count,
+        device_count=device_count,
+        tokens_per_microbatch_per_device=tokens_per_microbatch_per_device,
+        tokens_per_microbatch_per_process=tokens_per_microbatch_per_process,
+        world_tokens_per_microbatch=world_tokens_per_microbatch,
+        grad_accum_steps=grad_accum_steps,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -317,20 +435,27 @@ def main() -> int:
                         help="model tag to load from (default: largest in base_checkpoints)")
     parser.add_argument("--model-step", type=int, default=None,
                         help="model step to load from (default: last step)")
-    parser.add_argument("--load-optimizer", type=int, default=0,
+    parser.add_argument("--output-model-tag", type=str, default=None,
+                        help="model tag to save under in chatsft_checkpoints "
+                             "(default: --model-tag or d{depth})")
+    parser.add_argument("--load-optimizer", type=int, default=1,
                         help="warm-start optimizer from base checkpoint (0=no, 1=yes). "
-                             ": PT default 1; JAX-port default 0 (no warm-start optim file by default).")
+                             "PT default 1; missing optimizer files fall back to cold start.")
     # Training horizon
-    parser.add_argument("--num-iterations", type=int, default=100,
+    parser.add_argument("--num-iterations", type=int, default=-1,
                         help="number of optimization steps (-1 = full epoch). "
-                             ": PT default -1; JAX-port default 100 for Mac CPU realism.")
+                             "PT default -1.")
     # Batch sizes (default: inherit from pretrained checkpoint)
     parser.add_argument("--max-seq-len", type=int, default=None,
                         help="max context length (default: inherit from pretrain)")
     parser.add_argument("--device-batch-size", type=int, default=None,
                         help="per-device batch size (default: 4 if not set)")
     parser.add_argument("--total-batch-size", type=int, default=None,
-                        help="total batch size in tokens (default: device_bs * max_seq_len * world)")
+                        help="total batch size in tokens (default: inherit from pretrain, "
+                             "else device_bs * max_seq_len * jax.device_count())")
+    parser.add_argument("--grad-accum-impl", type=str, default="loop", choices=["loop"],
+                        help="gradient accumulation implementation. Only 'loop' is wired "
+                             "for SFT; it mirrors the validated base_train helper path.")
     # Optimization (default: inherit from pretrained checkpoint user_config or fallbacks)
     parser.add_argument("--embedding-lr", type=float, default=None,
                         help="learning rate for embedding parameters (Adam)")
@@ -352,9 +477,13 @@ def main() -> int:
                              ": minimal default for sanity tier (Mac CPU).")
     parser.add_argument("--eval-steps", type=int, default=4,
                         help="number of val batches for BPB measurement (default 4 sanity).")
-    parser.add_argument("--chatcore-every", type=int, default=-1,
+    parser.add_argument("--chatcore-every", type=int, default=200,
                         help="evaluate ChatCORE metric every N steps (-1 = disable). "
-                             ": chat_eval cascade — >= 0 raises NotImplementedError.")
+                             "PT default 200.")
+    parser.add_argument("--chatcore-max-cat", type=int, default=-1,
+                        help="max problems per categorical task for ChatCORE")
+    parser.add_argument("--chatcore-max-sample", type=int, default=24,
+                        help="max problems per generative task for ChatCORE")
     # Data mixture
     parser.add_argument("--mmlu-epochs", type=int, default=3,
                         help="number of epochs of MMLU in training mixture "
@@ -367,8 +496,8 @@ def main() -> int:
                         help="SFT training mixture scope :\n"
                              " full -- 7-source mixture (~1.07M rows)\n"
                              " reduced -- ~150K rows\n"
-                             " min — Minimum (~12K rows, Mac CPU sanity)\n"
-                             " identity-only — legacy (2K rows, ⚠️ catastrophic destruction)")
+                             " min -- minimum (~12K rows, Mac CPU sanity)\n"
+                             " identity-only -- legacy 2K-row compatibility mode")
     # Distributed
     parser.add_argument("--no-distributed", action="store_true",
                         help="Skip jax.distributed.initialize() (CPU dry run)")
@@ -379,17 +508,7 @@ def main() -> int:
     parser.add_argument("--log-every", type=int, default=10,
                         help="Log every N steps (master process only).")
     args = parser.parse_args()
-    user_config = vars(args).copy()
-
-    # ---------------------------------------------------------------------
-    # : chatcore_every >= 0 → NotImplementedError
-    # ---------------------------------------------------------------------
-    if args.chatcore_every > 0:
-        raise NotImplementedError(
-            " chat_eval not yet wired in -- --chatcore-every >= 0 needs the port. "
-            "Use --chatcore-every -1 (default, disable). "
-            "Plan a follow-up to call chat_eval directly."
-        )
+    raw_user_config = vars(args).copy()
 
     # ---------------------------------------------------------------------
     # Compute / distributed init
@@ -403,14 +522,17 @@ def main() -> int:
     setup_distributed_env_vars()
     mesh = make_mesh()
     process_count = jax.process_count()
+    local_device_count = jax.local_device_count()
+    device_count = jax.device_count()
     rank = jax.process_index()
     is_master = rank == 0
 
     if is_master:
         print("=" * 80)
-        print(f" chat_sft Stage B — process {rank}/{process_count}")
+        print(f" chat_sft - process {rank}/{process_count}")
         print(f" mesh: {mesh}")
         print(f" devices: {jax.devices()}")
+        print(f" local_device_count: {local_device_count} | device_count: {device_count}")
         print(f" bf16: {args.bf16}")
         print("=" * 80)
 
@@ -420,7 +542,7 @@ def main() -> int:
     wandb_run = DummyWandb() # : wandb dep removed
 
     # ---------------------------------------------------------------------
-    # Load base model (-cli cascade)
+    # Load base model.
     # ---------------------------------------------------------------------
     compute_dtype = jnp.bfloat16 if args.bf16 else jnp.float32
     model, tokenizer, meta = load_model(
@@ -429,10 +551,17 @@ def main() -> int:
         model_tag=args.model_tag,
         step=args.model_step,
     )
-    _print0(f"Loaded base model: tag={args.model_tag}, step={meta.get('step')}, "
+    base_model_tag = args.model_tag
+    base_model_step = meta.get("step")
+    _print0(f"Loaded base model: tag={base_model_tag}, step={base_model_step}, "
             f"vocab_size={meta['model_config']['vocab_size']}, "
             f"sequence_len={meta['model_config']['sequence_len']}, "
             f"compute_dtype={compute_dtype}")
+    if getattr(model.config, "attn_impl", "xla") == "splash":
+        from nanochat_jax.gpt import set_splash_mesh
+
+        set_splash_mesh(mesh)
+        _print0("Registered Splash Attention mesh for multi-chip TPU execution")
 
     # ---------------------------------------------------------------------
     # Inherit hyperparams from pretrained checkpoint (PT chat_sft.py:99-117 mirror)
@@ -459,30 +588,30 @@ def main() -> int:
         elif pretrain_val is not None and arg_val != pretrain_val:
             _print0(f"NOTE: --{name.replace('_', '-')}={arg_val} overrides pretrained {pretrain_val}")
 
-    # Compute total_batch_size if not set
-    if args.total_batch_size is None:
-        args.total_batch_size = args.device_batch_size * args.max_seq_len * process_count
-        _print0(f"Computed total_batch_size={args.total_batch_size}")
-
     depth = meta["model_config"]["n_layer"]
-    tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len
-    world_tokens_per_fwdbwd = tokens_per_fwdbwd * process_count
-    if args.total_batch_size % world_tokens_per_fwdbwd != 0:
-        # Adjust to closest valid value (round down)
-        grad_accum_steps = max(1, args.total_batch_size // world_tokens_per_fwdbwd)
-        args.total_batch_size = grad_accum_steps * world_tokens_per_fwdbwd
-        _print0(f"Adjusted total_batch_size={args.total_batch_size} (grad_accum={grad_accum_steps})")
-    grad_accum_steps = args.total_batch_size // world_tokens_per_fwdbwd
-    _print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = "
-            f"{tokens_per_fwdbwd:,}")
-    _print0(f"Tokens / micro-batch (world): {world_tokens_per_fwdbwd:,}")
+    requested_total_batch_size = args.total_batch_size
+    batch_semantics = resolve_batch_semantics(
+        device_batch_size=args.device_batch_size,
+        max_seq_len=args.max_seq_len,
+        total_batch_size=args.total_batch_size,
+        process_count=process_count,
+        local_device_count=local_device_count,
+        device_count=device_count,
+    )
+    args.total_batch_size = batch_semantics.total_batch_size
+    grad_accum_steps = batch_semantics.grad_accum_steps
+    if requested_total_batch_size != args.total_batch_size:
+        _print0(f"Resolved total_batch_size={args.total_batch_size:,} "
+                f"(requested/inherited={requested_total_batch_size})")
+    _print0(f"Rows / micro-batch / process: {batch_semantics.per_process_batch_size:,} "
+            f"({args.device_batch_size} per device x {batch_semantics.local_device_count} local devices)")
+    _print0(f"Tokens / micro-batch / device: {batch_semantics.tokens_per_microbatch_per_device:,}")
+    _print0(f"Tokens / micro-batch / process: {batch_semantics.tokens_per_microbatch_per_process:,}")
+    _print0(f"Tokens / micro-batch (world): {batch_semantics.world_tokens_per_microbatch:,}")
     _print0(f"Total batch size {args.total_batch_size:,} → grad_accum_steps: {grad_accum_steps}")
-
-    # SFT: grad_accum_steps > 1 is out of scope
     if grad_accum_steps > 1:
-        _print0(f"WARNING: grad_accum_steps={grad_accum_steps} > 1 is not supported. "
-                f"effective batch equals micro-batch.")
-        grad_accum_steps = 1
+        _print0(f"Using gradient accumulation: {grad_accum_steps} micro-batches "
+                f"per optimizer step ({args.grad_accum_impl})")
 
     # ---------------------------------------------------------------------
     # token_bytes
@@ -498,7 +627,7 @@ def main() -> int:
         embedding_lr=args.embedding_lr,
         unembedding_lr=args.unembedding_lr,
         matrix_lr=args.matrix_lr,
-        weight_decay=0.0, # SFT cascade
+        weight_decay=0.0, # SFT default
     )
 
     # Optional warm-start
@@ -531,7 +660,7 @@ def main() -> int:
     _print0(f"Applied init_lr_frac={args.init_lr_frac} to all param_groups")
 
     # ---------------------------------------------------------------------
-    # SFT data mixture: CustomJSON identity (Q-1 (B) scope)
+    # SFT data mixture: CustomJSON identity plus upstream conversation tasks.
     # ---------------------------------------------------------------------
     base_dir = get_base_dir()
     identity_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
@@ -542,7 +671,6 @@ def main() -> int:
         except Exception as e:
             _print0(f"WARNING: download failed ({e}). SFT will run with empty mixture.")
 
-    # : SFT scope expansion
     if args.sft_scope == "full":
         # PT 1:1 mirror — chat_sft.py:165-173
         train_tasks = [
@@ -555,7 +683,7 @@ def main() -> int:
             SpellingBee(size=80000, split="train"), # 80K rows
         ]
     elif args.sft_scope == "reduced":
-        # Q-1 (B) — catastrophic-forgetting check scope (~150K rows, TPU $0.6-1.2)
+        # Smaller public smoke/validation scope. Not a substitute for full SFT.
         train_tasks = [
             SmolTalk(split="train", stop=50000), # 50K (~10% of full)
             CustomJSON(filepath=identity_filepath),
@@ -566,14 +694,14 @@ def main() -> int:
             SpellingBee(size=20000, split="train"), # 20K (25% of full)
         ]
     elif args.sft_scope == "min":
-        # Q-1 (C) — Mac CPU sanity (~12K rows)
+        # Mac CPU sanity scope.
         train_tasks = [
             SmolTalk(split="train", stop=5000),
             CustomJSON(filepath=identity_filepath), # 1K
             MMLU(subset="all", split="auxiliary_train", stop=5000), # 5K
         ]
     elif args.sft_scope == "identity-only":
-        # legacy (⚠️ catastrophic destruction — Phase X.7 found cascade)
+        # Legacy compatibility scope.
         train_tasks = [
             CustomJSON(filepath=identity_filepath),
             CustomJSON(filepath=identity_filepath), # 2 epochs
@@ -591,7 +719,7 @@ def main() -> int:
             CustomJSON(filepath=identity_filepath), # legacy: same data for sanity
         ])
     else:
-        # : PT 1:1 — SmolTalk + MMLU + GSM8K test mixture (~29.6K rows)
+        # PT 1:1 - SmolTalk + MMLU + GSM8K test mixture (~29.6K rows)
         val_dataset = TaskMixture([
             SmolTalk(split="test"), # 24K rows
             MMLU(subset="all", split="test", stop=5200), # 5.2K (truncated to match PT ratios)
@@ -613,12 +741,15 @@ def main() -> int:
     train_loader = sft_data_generator_bos_bestfit(
         dataset=train_dataset,
         tokenizer=tokenizer,
-        device_batch_size=args.device_batch_size,
+        device_batch_size=batch_semantics.per_process_batch_size,
         max_seq_len=args.max_seq_len,
         ddp_rank=rank,
         ddp_world_size=process_count,
         state=train_state,
-        num_iterations=args.num_iterations,
+        num_iterations=(
+            args.num_iterations * grad_accum_steps
+            if args.num_iterations > 0 else args.num_iterations
+        ),
     )
 
     def build_val_loader():
@@ -626,7 +757,7 @@ def main() -> int:
         return sft_data_generator_bos_bestfit(
             dataset=val_dataset,
             tokenizer=tokenizer,
-            device_batch_size=args.device_batch_size,
+            device_batch_size=batch_semantics.per_process_batch_size,
             max_seq_len=args.max_seq_len,
             ddp_rank=rank,
             ddp_world_size=process_count,
@@ -637,8 +768,16 @@ def main() -> int:
     # ---------------------------------------------------------------------
     # Build sharded train_step factory
     # ---------------------------------------------------------------------
-    train_step_fn = make_train_step_sharded(mesh, param_groups, optim_state)
-    _print0("Built train_step_fn ")
+    if grad_accum_steps > 1:
+        compute_grads_fn, accumulate_grads_fn, apply_update_fn = make_grad_accum_fns(
+            mesh, param_groups, optim_state
+        )
+        train_step_fn = None
+        _print0("Built gradient accumulation train functions")
+    else:
+        compute_grads_fn = accumulate_grads_fn = apply_update_fn = None
+        train_step_fn = make_train_step_sharded(mesh, param_groups, optim_state)
+        _print0("Built train_step_fn")
 
     # ---------------------------------------------------------------------
     # Training loop (PT chat_sft.py:337-498 mirror, simplified)
@@ -649,63 +788,14 @@ def main() -> int:
     ema_beta = 0.9
     total_training_time = 0.0
 
-    # Prefetch first batch
-    x, y = next(train_loader)
-
     step = 0
     val_bpb = None
     while True:
-        # last_step DDP sync
-        if process_count > 1:
-            last_step_arr = jax.numpy.asarray([1 if train_state["last_step"] else 0], dtype=jnp.int32)
-            from jax.experimental import multihost_utils
-
-            gathered = multihost_utils.process_allgather(last_step_arr)
-            train_state["last_step"] = bool(int(gathered.max()))
-
-        # Eval
-        if train_state["last_step"] or (args.eval_every > 0 and step % args.eval_every == 0):
-            val_loader = build_val_loader()
-            try:
-                val_bpb = float(evaluate_bpb(
-                    model, val_loader, args.eval_steps, token_bytes
-                ))
-                _print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
-                if val_bpb < min_val_bpb:
-                    min_val_bpb = val_bpb
-                wandb_run.log({"step": step, "val/bpb": val_bpb})
-            except Exception as e:
-                _print0(f"WARNING: evaluate_bpb failed ({e}). Skipping eval.")
-                val_bpb = None
-
-        # save_checkpoint at last_step
-        if train_state["last_step"]:
-            output_dirname = args.model_tag if args.model_tag else f"d{depth}"
-            checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
-            meta_data = {
-                "step": step,
-                "val_bpb": val_bpb if val_bpb is not None else float("nan"),
-                "model_config": {
-                    "sequence_len": args.max_seq_len,
-                    "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": meta["model_config"]["n_head"],
-                    "n_kv_head": meta["model_config"]["n_kv_head"],
-                    "n_embd": meta["model_config"]["n_embd"],
-                    "window_pattern": meta["model_config"].get("window_pattern", "L"),
-                },
-                "user_config": user_config,
-            }
-            save_checkpoint(checkpoint_dir, step, model, optim_state, meta_data, rank=rank)
-            _print0(f"Saved SFT checkpoint to {checkpoint_dir}/[model|optim|meta]_{step:06d}.*")
-
-        if train_state["last_step"]:
-            break
-
         # ---------------------------------------------------------------------
-        # Single training step
+        # Training step
         # ---------------------------------------------------------------------
         t0 = time.time()
+        x, y = next(train_loader)
         x_jax = jnp.asarray(x)
         y_jax = jnp.asarray(y)
 
@@ -720,15 +810,42 @@ def main() -> int:
         muon_momentum = jnp.float32(get_muon_momentum_sft(step))
         muon_wd = jnp.float32(0.0) # SFT default
 
-        loss, optim_state = train_step_fn(
-            model, optim_state, x_jax, y_jax, lrm, muon_momentum, muon_wd,
-        )
+        if grad_accum_steps <= 1:
+            assert train_step_fn is not None
+            loss, optim_state = train_step_fn(
+                model, optim_state, x_jax, y_jax, lrm, muon_momentum, muon_wd,
+            )
+        else:
+            assert compute_grads_fn is not None
+            assert accumulate_grads_fn is not None
+            assert apply_update_fn is not None
+            total_loss = 0.0
+            micro_loss, acc_grads = compute_grads_fn(model, x_jax, y_jax)
+            total_loss += float(micro_loss)
+            for _ in range(1, grad_accum_steps):
+                x_micro, y_micro = next(train_loader)
+                micro_loss, acc_grads = accumulate_grads_fn(
+                    model, acc_grads, jnp.asarray(x_micro), jnp.asarray(y_micro)
+                )
+                total_loss += float(micro_loss)
+            inv_accum = jnp.float32(1.0 / grad_accum_steps)
+            acc_grads = jax.tree.map(lambda g: g * inv_accum, acc_grads)
+            loss = jnp.float32(total_loss / grad_accum_steps)
+            optim_state = apply_update_fn(
+                model, optim_state, acc_grads, lrm, muon_momentum, muon_wd
+            )
         train_loss = float(loss)
-        # Prefetch next batch
-        x, y = next(train_loader)
 
         t1 = time.time()
         dt = t1 - t0
+
+        # last_step DDP sync after consuming the final micro-batch for this step.
+        if process_count > 1:
+            last_step_arr = jax.numpy.asarray([1 if train_state["last_step"] else 0], dtype=jnp.int32)
+            from jax.experimental import multihost_utils
+
+            gathered = multihost_utils.process_allgather(last_step_arr)
+            train_state["last_step"] = bool(int(gathered.max()))
 
         # State
         step += 1
@@ -747,6 +864,129 @@ def main() -> int:
             )
             wandb_run.log({"step": step, "train/loss": debiased_loss, "train/dt": dt})
 
+        # Eval after the completed optimizer step, including the final step.
+        if train_state["last_step"] or (args.eval_every > 0 and step % args.eval_every == 0):
+            val_loader = build_val_loader()
+            try:
+                val_bpb = float(evaluate_bpb(
+                    model, val_loader, args.eval_steps, token_bytes
+                ))
+                _print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
+                if val_bpb < min_val_bpb:
+                    min_val_bpb = val_bpb
+                wandb_run.log({"step": step, "val/bpb": val_bpb})
+            except Exception as e:
+                _print0(f"WARNING: evaluate_bpb failed ({e}). Skipping eval.")
+                val_bpb = None
+
+        # Periodic ChatCORE eval (PT chat_sft.py:363-397 mirror).
+        if args.chatcore_every > 0 and (
+            train_state["last_step"] or (step > 0 and step % args.chatcore_every == 0)
+        ):
+            from nanochat_jax.engine import Engine
+            from scripts.chat_eval import run_chat_eval
+
+            all_tasks = [
+                "ARC-Easy",
+                "ARC-Challenge",
+                "MMLU",
+                "GSM8K",
+                "HumanEval",
+                "SpellingBee",
+            ]
+            categorical_tasks = {"ARC-Easy", "ARC-Challenge", "MMLU"}
+            baseline_accuracies = {
+                "ARC-Easy": 0.25,
+                "ARC-Challenge": 0.25,
+                "MMLU": 0.25,
+                "GSM8K": 0.0,
+                "HumanEval": 0.0,
+                "SpellingBee": 0.0,
+            }
+            task_results: dict[str, float] = {}
+            attn_state = set_attention_impl_for_chat_eval(model)
+            try:
+                if any(old_value == "splash" for _, _, old_value in attn_state):
+                    _print0("Using XLA attention for in-loop ChatCORE variable-length prompts")
+                engine = Engine(model, tokenizer)
+                for task_name in all_tasks:
+                    limit = (
+                        args.chatcore_max_cat
+                        if task_name in categorical_tasks
+                        else args.chatcore_max_sample
+                    )
+                    max_problems = None if limit < 0 else limit
+                    acc = run_chat_eval(
+                        task_name,
+                        model,
+                        tokenizer,
+                        engine,
+                        batch_size=batch_semantics.per_process_batch_size,
+                        max_problems=max_problems,
+                    )
+                    task_results[task_name] = acc
+                    _print0(f"  {task_name}: {100 * acc:.2f}%")
+            finally:
+                restore_attention_impl_state(attn_state)
+
+            def centered_mean(task_names: list[str] | set[str]) -> float:
+                return sum(
+                    (task_results[name] - baseline_accuracies[name])
+                    / (1.0 - baseline_accuracies[name])
+                    for name in task_names
+                ) / len(task_names)
+
+            chatcore = centered_mean(all_tasks)
+            chatcore_cat = centered_mean(categorical_tasks)
+            _print0(
+                f"Step {step:05d} | ChatCORE: {chatcore:.4f} | "
+                f"ChatCORE_cat: {chatcore_cat:.4f}"
+            )
+            wandb_run.log({
+                "step": step,
+                "chatcore_metric": chatcore,
+                "chatcore_cat": chatcore_cat,
+                **{f"chatcore/{task_name}": acc for task_name, acc in task_results.items()},
+            })
+
+        # save_checkpoint at last_step
+        if train_state["last_step"]:
+            output_dirname = args.output_model_tag or args.model_tag or f"d{depth}"
+            checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+            resolved_user_config = vars(args).copy()
+            output_model_config = dict(meta["model_config"])
+            output_model_config.update({
+                "sequence_len": args.max_seq_len,
+                "vocab_size": tokenizer.get_vocab_size(),
+                "n_layer": depth,
+                "n_head": meta["model_config"]["n_head"],
+                "n_kv_head": meta["model_config"]["n_kv_head"],
+                "n_embd": meta["model_config"]["n_embd"],
+                "window_pattern": meta["model_config"].get("window_pattern", "L"),
+            })
+            meta_data = {
+                "step": step,
+                "val_bpb": val_bpb if val_bpb is not None else float("nan"),
+                "model_config": output_model_config,
+                "sft": {
+                    "base_model_tag": base_model_tag,
+                    "base_model_step": base_model_step,
+                    "output_model_tag": output_dirname,
+                    "sft_scope": args.sft_scope,
+                    "train_rows": len(train_dataset),
+                    "val_rows": len(val_dataset),
+                    "mmlu_epochs": args.mmlu_epochs,
+                    "gsm8k_epochs": args.gsm8k_epochs,
+                    "batch_semantics": asdict(batch_semantics),
+                    "grad_accum_impl": args.grad_accum_impl,
+                },
+                "raw_user_config": raw_user_config,
+                "user_config": resolved_user_config,
+            }
+            save_checkpoint(checkpoint_dir, step, model, optim_state, meta_data, rank=rank)
+            _print0(f"Saved SFT checkpoint to {checkpoint_dir}/[model|optim|meta]_{step:06d}.*")
+            break
+
         # GC management (PT mirror)
         if step == 1:
             gc.collect()
@@ -758,6 +998,36 @@ def main() -> int:
     _print0(f"Total training time: {total_training_time:.2f}s")
     _print0(f"Min val_bpb: {min_val_bpb:.4f}")
     _print0(f"Final val_bpb: {val_bpb if val_bpb is not None else 'N/A'}")
+    if is_master:
+        min_val_bpb_report = None if min_val_bpb == float("inf") else min_val_bpb
+        log_report_safe(
+            section="Chat SFT",
+            data=[
+                vars(args),
+                {
+                    "base_model_tag": base_model_tag,
+                    "base_model_step": base_model_step,
+                    "output_model_tag": output_dirname,
+                    "checkpoint_dir": checkpoint_dir,
+                    "sft_scope": args.sft_scope,
+                    "train_rows": len(train_dataset),
+                    "val_rows": len(val_dataset),
+                    "Number of iterations": step,
+                    "JAX world size": process_count,
+                    "JAX device count": device_count,
+                    "grad_accum_steps": grad_accum_steps,
+                    "total_batch_size": args.total_batch_size,
+                    "max_seq_len": args.max_seq_len,
+                    "device_batch_size": args.device_batch_size,
+                },
+                {
+                    "Minimum validation bpb": min_val_bpb_report,
+                    "Final validation bpb": val_bpb,
+                    "Total training time s": total_training_time,
+                },
+                {"batch_semantics": asdict(batch_semantics)},
+            ],
+        )
     wandb_run.finish()
     return 0
 

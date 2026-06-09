@@ -8,6 +8,7 @@ import numpy as np
 from nanochat_jax.tokenizer import RustBPETokenizer
 from nanochat_jax.common import get_base_dir
 from nanochat_jax.dataset import parquets_iter_batched
+from nanochat_jax.report import log_report_safe
 
 # -----------------------------------------------------------------------------
 # Parse command line arguments
@@ -95,3 +96,20 @@ print(f"  token_bytes_min: {int(token_bytes_nonzero.min())}")
 print(f"  token_bytes_max: {int(token_bytes_nonzero.max())}")
 print(f"  token_bytes_mean: {token_bytes_nonzero.mean():.4f}")
 print(f"  token_bytes_std: {token_bytes_nonzero.std():.4f}")
+
+log_report_safe(
+    section="Tokenizer training",
+    data=[
+        vars(args),
+        {
+            "train_time": train_time,
+            "tokenizer_dir": tokenizer_dir,
+            "vocab_size": vocab_size,
+            "num_special_tokens": len(special_set),
+            "token_bytes_min": int(token_bytes_nonzero.min()),
+            "token_bytes_max": int(token_bytes_nonzero.max()),
+            "token_bytes_mean": float(token_bytes_nonzero.mean()),
+            "token_bytes_std": float(token_bytes_nonzero.std()),
+        },
+    ],
+)

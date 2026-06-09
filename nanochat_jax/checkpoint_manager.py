@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import dataclasses
 
 import jax
 import jax.numpy as jnp
@@ -53,6 +54,16 @@ def _patch_missing_config_keys(model_config_kwargs: dict) -> None:
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         _log0("Patching missing window_pattern in model config to 'L'")
+
+
+def _drop_unknown_config_keys(model_config_kwargs: dict) -> None:
+    """Drop meta keys that this checkout's ``GPTConfig`` does not implement."""
+    valid = {field.name for field in dataclasses.fields(GPTConfig)}
+    unknown = sorted(set(model_config_kwargs) - valid)
+    for key in unknown:
+        model_config_kwargs.pop(key)
+    if unknown:
+        _log0(f"Ignoring unsupported model_config keys: {unknown}")
 
 
 def _patch_missing_keys(model_data: dict, model_config: GPTConfig) -> None:
@@ -198,6 +209,7 @@ def build_model(
 
     model_config_kwargs = dict(meta_data["model_config"])
     _patch_missing_config_keys(model_config_kwargs)
+    _drop_unknown_config_keys(model_config_kwargs)
     _log0(f"Building model with config: {model_config_kwargs}")
 
     model_config = GPTConfig(
