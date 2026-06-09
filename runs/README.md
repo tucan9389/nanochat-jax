@@ -56,6 +56,10 @@ Key environment overrides:
 
 Cost basis for the current result is the 2026-06-04 `us-central1` v6e-8 spot price snapshot: `$4.321096/hr`. Spot pricing and capacity change; recheck before budgeting.
 
+Expected reproduction values (TPU-eval CORE and BPB at the final step) and the
+measured end-to-end cost are listed in
+[`dev/LEADERBOARD.md`](../dev/LEADERBOARD.md) under "Reproduction reference".
+
 Operating notes:
 
 - On TPU VMs, preinstall CPU-only torch before `pip install -e ".[tpu,dev]"`

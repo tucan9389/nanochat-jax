@@ -11,7 +11,11 @@
 
 > JAX / Flax NNX port of [Andrej Karpathy's nanochat](https://github.com/karpathy/nanochat), optimized for Google Cloud TPU.
 
-`nanochat-jax` is a TPU-optimized JAX/NNX port of `karpathy/nanochat`: same d24 baseline model shape, same 2048-token context, same 524K-token batch, same 16,704-step train horizon, and the same CORE eval protocol. The public run script follows the upstream-style end-to-end flow: tokenizer, base training/eval, SFT, ChatEval, and a generated markdown report.
+**Matched to the upstream d24 recipe:** the d24 model geometry (24 layers / 1536 wide / 12 heads), the 32,768-vocab tokenizer recipe, the 2048-token context, 524,288-token batches, the 16,704-step train horizon, the NVIDIA ClimbMix pretraining data, and the full 22-task CORE eval protocol.
+
+**Changed for the TPU stack:** JAX/Flax NNX instead of PyTorch, Pallas Splash Attention kernels, bf16 embedding storage, TPU mesh sharding, and no FP8 path yet. [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md) records the exact run config and reproduction bands.
+
+The public run script mirrors the upstream speedrun flow: tokenizer, base training/eval, SFT, ChatEval, and a generated markdown report.
 
 On v6e-8 spot, `nanochat-jax` reached `CORE=0.274` within a $100 TPU budget on the base-model CORE benchmark. The reference path is [`runs/speedrun.sh`](runs/speedrun.sh).
 
@@ -38,7 +42,7 @@ pip install -e ".[dev]"
 
 [`runs/speedrun.sh`](runs/speedrun.sh) is the public run script. It uses the d24 TPU train shape used by the current base result: `seq_len=2048`, total batch `524288`, Splash Attention, onehot value-embedding gradients, and model-tag checkpoint/eval continuity. It then trains an SFT checkpoint, runs ChatEval on the SFT checkpoint, and writes a report via `python -m nanochat_jax.report generate`.
 
-The default SFT ChatEval covers the validated categorical tasks: ARC-Easy, ARC-Challenge, and MMLU. Full six-task ChatEval, including GSM8K, HumanEval, and SpellingBee, remains available as an opt-in run.
+The default SFT ChatEval covers the validated categorical tasks: ARC-Easy, ARC-Challenge, and MMLU. Full six-task ChatEval, including GSM8K, HumanEval, and SpellingBee, remains available as an opt-in run. Measured post-SFT scores are recorded in [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md).
 
 On a v6e-8 TPU host:
 
@@ -132,6 +136,7 @@ Not in the default path yet:
 ## Acknowledgements
 
 - [Andrej Karpathy / nanochat](https://github.com/karpathy/nanochat) - the upstream PyTorch implementation.
+- NVIDIA ClimbMix ([`karpathy/climbmix-400b-shuffle`](https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle)) - the pretraining dataset.
 - [Keller Jordan / modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) - origin of the Muon optimizer.
 - [`google/jax`](https://github.com/google/jax) and [`google/flax`](https://github.com/google/flax) - the framework.
 - [`AI-Hypercomputer/maxtext`](https://github.com/AI-Hypercomputer/maxtext) - Splash Attention integration patterns.
