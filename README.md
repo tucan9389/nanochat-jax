@@ -11,9 +11,9 @@
 
 > JAX / Flax NNX port of [Andrej Karpathy's nanochat](https://github.com/karpathy/nanochat), optimized for Google Cloud TPU.
 
-`nanochat-jax` is a TPU-optimized JAX/NNX port of `karpathy/nanochat`: same d24 baseline model shape, same 2048-token context, same 524K-token batch, same 16,704-step train horizon, and the same CORE eval protocol.
+`nanochat-jax` is a TPU-optimized JAX/NNX port of `karpathy/nanochat`: same d24 baseline model shape, same 2048-token context, same 524K-token batch, same 16,704-step train horizon, and the same CORE eval protocol. The public run script follows the upstream-style end-to-end flow: tokenizer, base training/eval, SFT, ChatEval, and a generated markdown report.
 
-On v6e-8 spot, `nanochat-jax` reached `CORE=0.274` within a $100 TPU budget. The reference path is [`runs/speedrun.sh`](runs/speedrun.sh): d24 base training followed by CORE eval.
+On v6e-8 spot, `nanochat-jax` reached `CORE=0.274` within a $100 TPU budget on the base-model CORE benchmark. The reference path is [`runs/speedrun.sh`](runs/speedrun.sh).
 
 ## Getting started
 
@@ -23,6 +23,7 @@ On v6e-8 spot, `nanochat-jax` reached `CORE=0.274` within a $100 TPU budget. The
 python3.11 -m venv ~/venv
 source ~/venv/bin/activate
 pip install -U pip
+pip install "torch~=2.11.0" --index-url https://download.pytorch.org/whl/cpu
 pip install -e ".[tpu,dev]" \
     -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 ```
@@ -35,7 +36,9 @@ pip install -e ".[dev]"
 
 ## Reference run
 
-[`runs/speedrun.sh`](runs/speedrun.sh) is the public run script. It uses the d24 TPU train shape used by the current result: `seq_len=2048`, total batch `524288`, Splash Attention, onehot value-embedding gradients, and model-tag checkpoint/eval continuity.
+[`runs/speedrun.sh`](runs/speedrun.sh) is the public run script. It uses the d24 TPU train shape used by the current base result: `seq_len=2048`, total batch `524288`, Splash Attention, onehot value-embedding gradients, and model-tag checkpoint/eval continuity. It then trains an SFT checkpoint, runs ChatEval on the SFT checkpoint, and writes a report via `python -m nanochat_jax.report generate`.
+
+The default SFT ChatEval covers the validated categorical tasks: ARC-Easy, ARC-Challenge, and MMLU. Full six-task ChatEval, including GSM8K, HumanEval, and SpellingBee, remains available as an opt-in run.
 
 On a v6e-8 TPU host:
 
@@ -43,11 +46,13 @@ On a v6e-8 TPU host:
 bash runs/speedrun.sh
 ```
 
-CORE eval is the default. For a quick smoke run:
+For a wiring-only smoke run that creates a fresh tiny checkpoint:
 
 ```bash
-CORE_MAX_PER_TASK=50 NUM_ITERATIONS=250 bash runs/speedrun.sh
+SPEEDRUN_SMOKE=1 bash runs/speedrun.sh
 ```
+
+The smoke path is not quality evidence. It defaults to `~/.cache/nanochat-jax-smoke`, uses a tiny d2 model, and forces CPU unless `JAX_PLATFORMS` is already set.
 
 ## Cost note
 
@@ -56,11 +61,11 @@ The v6e-8 spot result fits within the $100 TPU budget. Pricing changes; see [dev
 ## Chat with the model
 
 ```bash
-python -m scripts.chat_cli --model-tag d24_speedrun                         # interactive
-python -m scripts.chat_cli --model-tag d24_speedrun --prompt "Hello" -t 0   # single-prompt, greedy
+python -m scripts.chat_cli -i sft --model-tag d24_speedrun_sft                         # interactive
+python -m scripts.chat_cli -i sft --model-tag d24_speedrun_sft --prompt "Hello" -t 0   # single-prompt, greedy
 ```
 
-The speedrun checkpoint is a base model. Instruction following is limited until an SFT checkpoint is trained.
+Use `-i base --model-tag d24_speedrun` to inspect the pretrained base checkpoint directly. Base models have limited instruction following because they have not seen chat-formatted SFT data.
 
 ## File structure
 
@@ -76,6 +81,7 @@ The speedrun checkpoint is a base model. Instruction following is limited until 
 |   |-- engine.py                 # KV cache + sampling
 |   |-- checkpoint_manager.py     # save / load + optimizer state
 |   |-- common.py                 # cache dir, distributed info, file lock
+|   |-- report.py                 # markdown report reset/log/generate
 |   |-- core_eval.py              # DCLM CORE tasks
 |   |-- loss_eval.py              # bits-per-byte
 |   |-- dataloader.py             # BOS-aligned best-fit packing
@@ -93,7 +99,7 @@ The speedrun checkpoint is a base model. Instruction following is limited until 
 |   |-- tok_train.py              # tokenizer train
 |   `-- tok_eval.py               # tokenizer eval
 |-- runs/
-|   |-- speedrun.sh               # public d24 reference run
+|   |-- speedrun.sh               # public d24 e2e reference run
 |   `-- README.md
 |-- tests/
 `-- dev/
@@ -113,16 +119,15 @@ The speedrun checkpoint is a base model. Instruction following is limited until 
 Done:
 
 - [x] d24 v6e-8 TPU/JAX train result with BPB and CORE artifacts.
-- [x] Public speedrun path from base train to BPB/CORE eval.
+- [x] Public speedrun wiring from tokenizer through base/SFT/ChatEval/report.
+- [x] Full-mixture SFT checkpoint path and post-SFT categorical ChatEval.
 - [x] Pallas Splash Attention path.
 - [x] Muon optimizer support.
 
 Not in the default path yet:
 
-- [ ] SFT and chat eval publish-path validation.
-- [ ] Upstream 8xH100 Time-to-GPT-2 leaderboard claim.
-- [ ] v5p rows; retired until a separate parity audit.
-- [ ] RL fine-tuning, FP8 training, and web chat UI.
+- [ ] RL fine-tuning.
+- [ ] FP8 training.
 
 ## Acknowledgements
 

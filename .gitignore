@@ -37,6 +37,7 @@ external/
 
 # Logs
 *.log
+report.md
 
 # Internal work-cascade history (lives only on prev-main)
 docs/work/

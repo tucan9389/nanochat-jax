@@ -40,7 +40,7 @@ Homepage = "https://github.com/tucan9389/nanochat-jax"
 Upstream = "https://github.com/karpathy/nanochat"
 
 [tool.hatch.build.targets.wheel]
-packages = ["nanochat_jax"]
+packages = ["nanochat_jax", "scripts"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
