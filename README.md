@@ -15,16 +15,18 @@
 
 **Changed for the TPU stack:** JAX/Flax NNX instead of PyTorch, Pallas Splash Attention kernels, bf16 embedding storage, TPU mesh sharding, and no FP8 path yet. [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md) records the exact run config and reproduction bands.
 
+**Intentionally preserved divergences:** the port differs from upstream in four known, small places (a decode-window off-by-one, CORE-eval prompt truncation, the smear_gate init, and the SpellingBee SFT templates). They predate the published runs, so "fixing" them would break their reproduction — each is documented in [`dev/REPRODUCTION-GUARDS.md`](dev/REPRODUCTION-GUARDS.md) and marked with a NOTE comment at its code site.
+
 The public run script mirrors the upstream speedrun flow: tokenizer, base training/eval, SFT, ChatEval, and a generated markdown report.
 
 On v6e-8 spot, `nanochat-jax` reached `CORE=0.274` within a $100 TPU budget on the base-model CORE benchmark. The reference path is [`runs/speedrun.sh`](runs/speedrun.sh).
 
 ## Getting started
 
-`nanochat-jax` uses a standard Python venv. For TPU:
+`nanochat-jax` uses a standard Python venv with Python 3.11+. Note that TPU VMs ship Python 3.10, so get a newer interpreter first — the verified path is [`uv`](https://docs.astral.sh/uv/) (`uv venv --python 3.12 ~/venv`), or install `python3.11` from your distro. For TPU:
 
 ```bash
-python3.11 -m venv ~/venv
+python3.11 -m venv ~/venv   # or: uv venv --python 3.12 ~/venv
 source ~/venv/bin/activate
 pip install -U pip
 pip install "torch~=2.11.0" --index-url https://download.pytorch.org/whl/cpu
@@ -42,7 +44,7 @@ pip install -e ".[dev]"
 
 [`runs/speedrun.sh`](runs/speedrun.sh) is the public run script. It uses the d24 TPU train shape used by the current base result: `seq_len=2048`, total batch `524288`, Splash Attention, onehot value-embedding gradients, and model-tag checkpoint/eval continuity. It then trains an SFT checkpoint, runs ChatEval on the SFT checkpoint, and writes a report via `python -m nanochat_jax.report generate`.
 
-The default SFT ChatEval covers the validated categorical tasks: ARC-Easy, ARC-Challenge, and MMLU. Full six-task ChatEval, including GSM8K, HumanEval, and SpellingBee, remains available as an opt-in run. Measured post-SFT scores are recorded in [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md).
+SFT ChatEval covers the validated categorical tasks: ARC-Easy, ARC-Challenge, and MMLU. The generative tasks (GSM8K, HumanEval, SpellingBee) are not part of the pipeline — the current JAX generative eval path is too slow to complete them at full scale; they can be scored manually with `scripts/chat_eval.py --task-name`. Measured post-SFT scores are recorded in [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md).
 
 On a v6e-8 TPU host:
 
@@ -50,10 +52,10 @@ On a v6e-8 TPU host:
 bash runs/speedrun.sh
 ```
 
-For a wiring-only smoke run that creates a fresh tiny checkpoint:
+For a wiring-only CPU smoke run that creates a fresh tiny checkpoint:
 
 ```bash
-SPEEDRUN_SMOKE=1 bash runs/speedrun.sh
+bash runs/runcpu.sh
 ```
 
 The smoke path is not quality evidence. It defaults to `~/.cache/nanochat-jax-smoke`, uses a tiny d2 model, and forces CPU unless `JAX_PLATFORMS` is already set.
@@ -80,10 +82,15 @@ Use `-i base --model-tag d24_speedrun` to inspect the pretrained base checkpoint
 |-- pyproject.toml
 |-- nanochat_jax/
 |   |-- gpt.py                    # GPT model: XLA + Splash Attention paths
-|   |-- attention.py              # attention backend helpers
+|   |-- attention.py              # attention backend helpers (Splash/Pallas wiring)
+|   |-- layers.py                 # NanochatLinear
+|   |-- ops.py                    # rms_norm, rotary, ReLU^2, softcap
 |   |-- optim.py                  # AdamW + Muon
-|   |-- base_train.py             # train_step, schedules, sharded factory
-|   |-- base_train_config.py      # base train config and sizing math
+|   |-- grad_utils.py             # loss + gradient computation
+|   |-- train_core.py             # train_step, schedules, sharded/fused factories
+|   |-- base_train_config.py      # muP sizing math + weight-decay reference
+|   |-- sharding.py               # Mesh + Muon ZeRO-2 spec
+|   |-- perf.py                   # hardware peak FLOPS table + MFU helpers
 |   |-- engine.py                 # KV cache + sampling
 |   |-- checkpoint_manager.py     # save / load + optimizer state
 |   |-- common.py                 # cache dir, distributed info, file lock
@@ -93,8 +100,8 @@ Use `-i base --model-tag d24_speedrun` to inspect the pretrained base checkpoint
 |   |-- dataloader.py             # BOS-aligned best-fit packing
 |   |-- dataset.py                # parquet shard download / iteration
 |   |-- tokenizer.py              # RustBPE + tiktoken + HF wrapper
-|   |-- layers.py                 # NanochatLinear
-|   |-- sharding.py               # Mesh + Muon ZeRO-2 spec
+|   |-- execution.py              # sandboxed Python execution (tool use, HumanEval)
+|   |-- weight_converter.py       # PyTorch state_dict <-> JAX pytree converter
 |   `-- tasks/                    # ARC, MMLU, GSM8K, HumanEval, SmolTalk, ...
 |-- scripts/
 |   |-- base_train.py             # base training
@@ -105,11 +112,12 @@ Use `-i base --model-tag d24_speedrun` to inspect the pretrained base checkpoint
 |   |-- tok_train.py              # tokenizer train
 |   `-- tok_eval.py               # tokenizer eval
 |-- runs/
-|   |-- speedrun.sh               # public d24 e2e reference run
+|   |-- speedrun.sh               # public d24 e2e reference run (v6e-8 TPU)
+|   |-- runcpu.sh                 # same pipeline on a tiny d2 model (CPU wiring check)
 |   `-- README.md
-|-- tests/
 `-- dev/
-    `-- LEADERBOARD.md
+    |-- LEADERBOARD.md            # published results + reproduction reference
+    `-- REPRODUCTION-GUARDS.md    # the 4 intentional upstream divergences
 ```
 
 ## TPU notes

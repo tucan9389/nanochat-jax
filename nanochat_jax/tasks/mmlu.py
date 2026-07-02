@@ -2,7 +2,8 @@
 The MMLU dataset.
 https://huggingface.co/datasets/cais/mmlu
 
-PT 1:1 mirror — substitution 0 (algorithm framework-agnostic, datasets lib only).
+1:1 port of upstream ``tasks/mmlu.py`` — the task logic is framework-agnostic
+(only the ``datasets`` library is used), so it is unchanged from PyTorch nanochat.
 """
 
 from datasets import load_dataset
@@ -70,7 +71,7 @@ class MMLU(Task):
         return conversation
 
     def evaluate(self, conversation, assistant_response):
-        # the assert prevents footguns; matches PT 1:1
+        # the assert prevents footguns; matches upstream 1:1
         assert assistant_response in self.letters, (
             f"MMLU answer {assistant_response} is expected to be one of {self.letters}"
         )

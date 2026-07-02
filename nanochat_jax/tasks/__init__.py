@@ -10,10 +10,12 @@ Modules:
 - :mod:`tasks.humaneval` -- ``HumanEval`` (with sandboxed execution)
 - :mod:`tasks.spellingbee` -- ``SpellingBee`` / ``SimpleSpelling``
 
-Tasks that pull from the ``datasets`` library are NOT imported eagerly here
-(``from datasets import load_dataset`` is slow at startup). Callers should
-import from the explicit module path, e.g.
-``from nanochat_jax.tasks.arc import ARC``.
+Most tasks that pull from the ``datasets`` library are NOT imported eagerly
+here (``from datasets import load_dataset`` is slow at startup) — import them
+from the explicit module path, e.g. ``from nanochat_jax.tasks.arc import ARC``.
+The exception is :class:`SmolTalk` (also ``datasets``-backed), re-exported
+eagerly alongside the dependency-free :class:`Task` / :class:`CustomJSON`
+because it anchors every SFT mixture.
 """
 
 from nanochat_jax.tasks.common import Task, TaskMixture, TaskSequence, render_mc

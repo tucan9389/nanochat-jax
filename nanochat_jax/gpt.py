@@ -36,7 +36,6 @@ Granularity = Literal["high", "block", "minimal"]
 # TPU/Pallas implementation details out of the model definition.
 _call_splash_attention = _attention.call_splash_attention
 _dpa_window_size = _attention.dpa_window_size
-_make_splash_kernel = _attention.make_splash_kernel
 get_splash_mesh = _attention.get_splash_mesh
 set_splash_mesh = _attention.set_splash_mesh
 
@@ -51,13 +50,17 @@ class GPTConfig:
     """Mirror of nanochat ``GPTConfig`` with extra knobs for JAX precision.
 
     ``compute_dtype`` controls the activation dtype. ``jnp.float32`` keeps the
-    full-precision path; ``jnp.bfloat16`` triggers the cascade (cos/sin/wte
-    cast) and lets every op keep input dtype as it propagates. Linear master
-    weights remain fp32 inside :class:`NanochatLinear`.
+    full-precision path; ``jnp.bfloat16`` triggers the bf16 cast chain
+    (cos/sin/wte cast) and lets every op keep input dtype as it propagates.
+    Linear master weights remain fp32 inside :class:`NanochatLinear`.
 
     ``attn_impl="splash"`` opts into the TPU Pallas kernel for training/prefill
-    (decode keeps xla). Splash is only valid on TPU; CPU emulation is
-    numerically incorrect.
+    (decode keeps xla). Splash requires TPU hardware; CPU can only run it via
+    the Pallas interpreter, which is far too slow for real use.
+
+    The field defaults below are small unit-test values; production shapes
+    come from ``make_config`` in ``nanochat_jax.base_train_config`` (the muP
+    sizing rule — e.g. d24 resolves to 2048/32768/24/12/1536, ``"SSSL"``).
     """
 
     sequence_len: int = 128
@@ -73,7 +76,7 @@ class GPTConfig:
     splash_block_q: int | None = None
     splash_block_kv: int | None = None
     splash_block_kv_compute: int | None = None
-    ve_grad_impl: Literal["scatter", "onehot", "segsum", "segsum_fp32"] = "scatter"
+    ve_grad_impl: Literal["scatter", "onehot"] = "scatter"
 
 
 def has_ve(layer_idx: int, n_layer: int) -> bool:
@@ -107,18 +110,6 @@ def _ve_lookup_bwd(impl: str, res, g: jax.Array):
             (((0,), (0,)), ((), ())),
             precision=jax.lax.Precision.HIGHEST,
             preferred_element_type=jnp.float32,
-        )
-    elif impl == "segsum_fp32":
-        grad_table = jax.ops.segment_sum(
-            flat_g.astype(jnp.float32),
-            flat_idx,
-            num_segments=num_embeddings,
-        )
-    elif impl == "segsum":
-        grad_table = jax.ops.segment_sum(
-            flat_g,
-            flat_idx,
-            num_segments=num_embeddings,
         )
     else:
         raise ValueError(f"unknown ve_grad_impl={impl!r}")
@@ -324,6 +315,10 @@ class CausalSelfAttention(nnx.Module):
             causal = k_idx[None, :] <= q_global[:, None]
             bounded = k_idx[None, :] < total_valid
             mask_2d = causal & bounded
+            # NOTE: intentional divergence from upstream, kept to preserve the
+            # published-d24 reproduction (see dev/REPRODUCTION-GUARDS.md). This
+            # decode mask spans `w` keys where prefill (and upstream
+            # flash_attention) spans `w+1`. Do not "fix" casually.
             left_window = window_size[0]
             if left_window > 0:
                 window_mask = k_idx[None, :] >= (q_global[:, None] - left_window + 1)
@@ -382,8 +377,8 @@ class GPT(nnx.Module):
 
     The production ``__call__`` returns logits, or a scalar loss if ``targets``
     is provided. ``forward_with_intermediates`` is a testing helper that
-    captures named intermediate tensors at one of three granularities; it is
-    paired with the PyTorch-side reference in ``scripts/generate_golden.py``.
+    captures named intermediate tensors at one of three granularities; the
+    maintainer's golden-parity net pairs it with a PyTorch-side generator.
     """
 
     def __init__(
@@ -413,6 +408,11 @@ class GPT(nnx.Module):
 
         self.resid_lambdas = nnx.Param(jnp.ones((cfg.n_layer,), dtype=jnp.float32))
         self.x0_lambdas = nnx.Param(jnp.zeros((cfg.n_layer,), dtype=jnp.float32))
+        # NOTE: intentional divergence from upstream, kept to preserve the
+        # published-d24 reproduction (see dev/REPRODUCTION-GUARDS.md).
+        # smear_gate keeps this default (signed lecun) init: init_weights below
+        # re-initializes ve_gate but not smear_gate, while upstream uses
+        # uniform(0, 0.02).
         self.smear_gate = NanochatLinear(24, 1, rngs=rngs)
         self.smear_lambda = nnx.Param(jnp.zeros((1,), dtype=jnp.float32))
         self.backout_lambda = nnx.Param(0.2 * jnp.ones((1,), dtype=jnp.float32))
@@ -647,7 +647,7 @@ class GPT(nnx.Module):
 
         # Cast scalar params to x.dtype explicitly: PyTorch promotes a 0-D
         # bf16 scalar against a bf16 tensor to bf16, but JAX promotes to fp32,
-        # which would silently break the bf16 cascade.
+        # which would silently break the bf16 cast chain.
         n_layer = cfg.n_layer
         backout_layer = n_layer // 2
         x_backout: jax.Array | None = None
@@ -698,7 +698,8 @@ class GPT(nnx.Module):
         - ``high``: block + ``x_after_norm0``, ``block_{i}_input``,
           ``logits_pre_softcap``
 
-        Paired with the PyTorch-side reference in ``scripts/generate_golden.py``.
+        The maintainer's golden-parity net pairs this with a PyTorch-side
+        reference generator.
         """
         cfg = self.config
         ints: dict[str, jax.Array] = {}

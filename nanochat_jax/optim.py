@@ -271,6 +271,11 @@ def adamw_step(
 def polar_express_iters(g_pt: jax.Array, ns_steps: int = 5) -> jax.Array:
     """5-step Polar Express orthogonalization in PyTorch layout ``(..., out, in)``.
 
+    Muon replaces each matrix gradient with the nearest (semi-)orthogonal matrix,
+    which equalizes the update's singular values so no single direction dominates
+    the step. The Polar Express is a quintic Newton-Schulz iteration that
+    approximates that orthogonalization cheaply (no SVD).
+
     Computes ``X = orthogonalize(g)`` via Newton-Schulz with the Polar Express
     quintic coefficients. The branches handle tall vs wide matrices (the
     quadratic form ``X.T @ X`` or ``X @ X.T`` is whichever is smaller).
@@ -336,7 +341,8 @@ def muon_step(
     1. Nesterov momentum (lerp expansion).
     2. Optional cast of the momentum-updated gradient to ``polar_express_dtype``
        before orthogonalization. Defaults to fp32; setting to bf16 mirrors
-       upstream nanochat's bf16 NS path.
+       upstream's Newton-Schulz input cast (``X = g.bfloat16()``) — the
+       published recipe keeps fp32 here.
     3. Polar Express orthogonalization (5-step Newton-Schulz).
     4. NorMuon variance reduction.
     5. Cautious weight decay + parameter update:

@@ -10,14 +10,13 @@ Scopes (``--sft-scope``):
   SimpleSpelling + SpellingBee (~1M rows). Mirrors upstream nanochat.
 - ``reduced``: smaller subsets of the above (~150K rows) for cheaper TPU runs.
 - ``min``: ~12K rows for Mac CPU sanity.
-- ``identity-only``: legacy 2K rows; kept only for backward compatibility and
-  not recommended for public quality runs.
 
 Usage::
 
-    # Mac CPU 5-step sanity
+    # Mac CPU 5-step sanity (--chatcore-every -1 skips the expensive
+    # generative ChatCORE eval that otherwise still fires on the last step)
     python -m scripts.chat_sft --model-tag d12_jax_seed42 --num-iterations 5 \\
-        --device-batch-size 2 --max-seq-len 256 --no-distributed
+        --device-batch-size 2 --max-seq-len 256 --no-distributed --chatcore-every -1
 
     # TPU v6e-1 spot 100-step
     python -m scripts.chat_sft --model-tag d12_jax_seed42 --num-iterations 100 \\
@@ -28,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import logging
 import os
 import sys
 import time
@@ -44,7 +42,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from nanochat_jax.base_train import ( # noqa: E402 — sys.path mutation above
+from nanochat_jax.train_core import ( # noqa: E402 — sys.path mutation above
     init_train_state,
     make_grad_accum_fns,
     make_train_step_sharded,
@@ -72,10 +70,7 @@ if TYPE_CHECKING:
     from nanochat_jax.tasks import Task
 
 
-logger = logging.getLogger(__name__)
-
-
-# Identity conversations URL (PT 1:1 auto-download path)
+# Identity conversations URL (auto-download path)
 IDENTITY_CONVERSATIONS_URL = (
     "https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl"
 )
@@ -87,7 +82,7 @@ IDENTITY_CONVERSATIONS_URL = (
 
 
 class DummyWandb:
-    """No-op wandb stub (PT 1:1 mirror — chat_sft.py:DummyWandb).
+    """No-op wandb stub (mirrors upstream's DummyWandb).
 
     Allows `wandb_run.log({...})` and `wandb_run.finish()` to be no-ops when
     `--run dummy` is specified or wandb dep is not installed.
@@ -106,7 +101,7 @@ class DummyWandb:
 
 
 def _print0(message: str) -> None:
-    """Master-only print ."""
+    """Master-only print."""
     if jax.process_index() == 0:
         print(message, flush=True)
 
@@ -153,9 +148,9 @@ def get_lr_multiplier_progress(
     warmdown_ratio: float = 0.5,
     final_lr_frac: float = 0.0,
 ) -> float:
-    """Linear warmup + constant + linear warmdown (PT chat_sft.py:314-321 mirror).
+    """Linear warmup + constant + linear warmdown (mirrors upstream chat_sft.py).
 
-    Uses ``progress`` (0→1 normalized) instead of step-indexed (PT chat_sft uses
+    Uses ``progress`` (0→1 normalized) instead of step-indexed (upstream uses
     ``progress = consumed / dataset_size`` since num_iterations may be unknown).
 
     Args:
@@ -177,12 +172,12 @@ def get_lr_multiplier_progress(
 
 
 def get_muon_momentum_sft(it: int) -> float:
-    """SFT Muon momentum schedule (PT chat_sft.py:324-327 mirror).
+    """SFT Muon momentum schedule (mirrors upstream chat_sft.py).
 
     Simple linear interpolation from 0.85 to 0.95 over first 300 steps,
     then constant 0.95.
 
-    Note: differs from base_train.get_muon_momentum (which has 3-phase warmdown).
+    Note: differs from train_core.get_muon_momentum (which has 3-phase warmdown).
     """
     frac = min(it / 300, 1)
     return (1 - frac) * 0.85 + frac * 0.95
@@ -290,7 +285,7 @@ def sft_data_generator_bos_bestfit(
     num_iterations: int,
     buffer_size: int = 100,
 ):
-    """BOS-aligned best-fit packing dataloader (PT chat_sft.py:187-305 mirror).
+    """BOS-aligned best-fit packing dataloader (mirrors upstream chat_sft.py).
 
     Each row in the batch starts with BOS (beginning of a conversation).
     Conversations are packed using best-fit algorithm. When no conversation fits,
@@ -425,7 +420,7 @@ def sft_data_generator_bos_bestfit(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description=" SFT (Supervised Fine-Tuning) for nanochat-jax"
+        description="SFT (Supervised Fine-Tuning) for nanochat-jax"
     )
     # Logging
     parser.add_argument("--run", type=str, default="dummy",
@@ -440,11 +435,11 @@ def main() -> int:
                              "(default: --model-tag or d{depth})")
     parser.add_argument("--load-optimizer", type=int, default=1,
                         help="warm-start optimizer from base checkpoint (0=no, 1=yes). "
-                             "PT default 1; missing optimizer files fall back to cold start.")
+                             "Upstream default 1; missing optimizer files fall back to cold start.")
     # Training horizon
     parser.add_argument("--num-iterations", type=int, default=-1,
                         help="number of optimization steps (-1 = full epoch). "
-                             "PT default -1.")
+                             "Upstream default -1.")
     # Batch sizes (default: inherit from pretrained checkpoint)
     parser.add_argument("--max-seq-len", type=int, default=None,
                         help="max context length (default: inherit from pretrain)")
@@ -453,9 +448,6 @@ def main() -> int:
     parser.add_argument("--total-batch-size", type=int, default=None,
                         help="total batch size in tokens (default: inherit from pretrain, "
                              "else device_bs * max_seq_len * jax.device_count())")
-    parser.add_argument("--grad-accum-impl", type=str, default="loop", choices=["loop"],
-                        help="gradient accumulation implementation. Only 'loop' is wired "
-                             "for SFT; it mirrors the validated base_train helper path.")
     # Optimization (default: inherit from pretrained checkpoint user_config or fallbacks)
     parser.add_argument("--embedding-lr", type=float, default=None,
                         help="learning rate for embedding parameters (Adam)")
@@ -473,13 +465,12 @@ def main() -> int:
                         help="final LR as fraction of initial LR")
     # Evaluation
     parser.add_argument("--eval-every", type=int, default=-1,
-                        help="evaluate val bpb every N steps (-1 = only at end). "
-                             ": minimal default for sanity tier (Mac CPU).")
+                        help="evaluate val bpb every N steps (-1 = only at end)")
     parser.add_argument("--eval-steps", type=int, default=4,
-                        help="number of val batches for BPB measurement (default 4 sanity).")
+                        help="number of val batches for BPB measurement")
     parser.add_argument("--chatcore-every", type=int, default=200,
                         help="evaluate ChatCORE metric every N steps (-1 = disable). "
-                             "PT default 200.")
+                             "Upstream default 200.")
     parser.add_argument("--chatcore-max-cat", type=int, default=-1,
                         help="max problems per categorical task for ChatCORE")
     parser.add_argument("--chatcore-max-sample", type=int, default=24,
@@ -487,17 +478,16 @@ def main() -> int:
     # Data mixture
     parser.add_argument("--mmlu-epochs", type=int, default=3,
                         help="number of epochs of MMLU in training mixture "
-                             "(teaches Multiple Choice). PT default 3.")
+                             "(teaches Multiple Choice). Upstream default 3.")
     parser.add_argument("--gsm8k-epochs", type=int, default=4,
                         help="number of epochs of GSM8K in training mixture "
-                             "(teaches Math and Tool Use). PT default 4.")
+                             "(teaches Math and Tool Use). Upstream default 4.")
     parser.add_argument("--sft-scope", type=str, default="full",
-                        choices=["full", "reduced", "min", "identity-only"],
-                        help="SFT training mixture scope :\n"
+                        choices=["full", "reduced", "min"],
+                        help="SFT training mixture scope:\n"
                              " full -- 7-source mixture (~1.07M rows)\n"
                              " reduced -- ~150K rows\n"
-                             " min -- minimum (~12K rows, Mac CPU sanity)\n"
-                             " identity-only -- legacy 2K-row compatibility mode")
+                             " min -- minimum (~12K rows, Mac CPU sanity)")
     # Distributed
     parser.add_argument("--no-distributed", action="store_true",
                         help="Skip jax.distributed.initialize() (CPU dry run)")
@@ -537,9 +527,9 @@ def main() -> int:
         print("=" * 80)
 
     # ---------------------------------------------------------------------
-    # wandb (DummyWandb mirror — )
+    # wandb (stubbed out — DummyWandb mirrors upstream's dummy run object)
     # ---------------------------------------------------------------------
-    wandb_run = DummyWandb() # : wandb dep removed
+    wandb_run = DummyWandb()  # wandb dependency removed
 
     # ---------------------------------------------------------------------
     # Load base model.
@@ -564,11 +554,11 @@ def main() -> int:
         _print0("Registered Splash Attention mesh for multi-chip TPU execution")
 
     # ---------------------------------------------------------------------
-    # Inherit hyperparams from pretrained checkpoint (PT chat_sft.py:99-117 mirror)
+    # Inherit hyperparams from the pretrained checkpoint (mirrors upstream chat_sft.py)
     # ---------------------------------------------------------------------
     pretrain_user_config = meta.get("user_config", {})
     for name, fallback, source in [
-        ("max_seq_len", 2048, meta["model_config"] if "sequence_len" in meta.get("model_config", {}) else meta),
+        ("max_seq_len", 2048, None),  # special-cased below (model_config.sequence_len)
         ("device_batch_size", 4, meta),
         ("total_batch_size", None, meta), # computed if None
         ("embedding_lr", 0.3, pretrain_user_config),
@@ -611,7 +601,7 @@ def main() -> int:
     _print0(f"Total batch size {args.total_batch_size:,} → grad_accum_steps: {grad_accum_steps}")
     if grad_accum_steps > 1:
         _print0(f"Using gradient accumulation: {grad_accum_steps} micro-batches "
-                f"per optimizer step ({args.grad_accum_impl})")
+                f"per optimizer step (loop)")
 
     # ---------------------------------------------------------------------
     # token_bytes
@@ -640,13 +630,9 @@ def main() -> int:
                 step=args.model_step,
             )
             if warm_state is not None:
-                # Preserve fresh SFT LRs (PT chat_sft.py:144-148 pattern)
-                base_lrs = [g["lr"] for g in param_groups]
                 optim_state = warm_state
-                # Note: LRs are scheduled per-step in train loop, so no need to
-                # explicitly restore here. The scheduling reads from initial_lr
-                # which is set in init_train_state.
-                _ = base_lrs # reserved for future PT-mirror semantics
+                # LRs are scheduled per-step in the train loop (reading initial_lr
+                # set by init_train_state), so there is nothing to restore here.
                 _print0("Loaded base optimizer state (warm-start, LRs reset to SFT initial)")
             else:
                 _print0("WARNING: base optimizer state not found — cold-start optim_state")
@@ -672,7 +658,7 @@ def main() -> int:
             _print0(f"WARNING: download failed ({e}). SFT will run with empty mixture.")
 
     if args.sft_scope == "full":
-        # PT 1:1 mirror — chat_sft.py:165-173
+        # mirrors upstream chat_sft.py
         train_tasks = [
             SmolTalk(split="train"), # 460K rows of general conversations
             CustomJSON(filepath=identity_filepath), # 1000 rows of synthetic identity conversations
@@ -700,31 +686,23 @@ def main() -> int:
             CustomJSON(filepath=identity_filepath), # 1K
             MMLU(subset="all", split="auxiliary_train", stop=5000), # 5K
         ]
-    elif args.sft_scope == "identity-only":
-        # Legacy compatibility scope.
-        train_tasks = [
-            CustomJSON(filepath=identity_filepath),
-            CustomJSON(filepath=identity_filepath), # 2 epochs
-        ]
     else:
         raise ValueError(f"Unknown sft_scope: {args.sft_scope}")
 
     train_dataset = TaskMixture(train_tasks)
-    _print0(f"Training mixture (sft_scope={args.sft_scope}): {len(train_dataset):,} rows "
-            f"(MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
+    epochs_note = (
+        f" (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})"
+        if args.sft_scope == "full" else ""
+    )
+    _print0(f"Training mixture (sft_scope={args.sft_scope}): {len(train_dataset):,} rows"
+            f"{epochs_note}")
 
-    # Val dataset (identity-only is legacy)
-    if args.sft_scope == "identity-only":
-        val_dataset = TaskMixture([
-            CustomJSON(filepath=identity_filepath), # legacy: same data for sanity
-        ])
-    else:
-        # PT 1:1 - SmolTalk + MMLU + GSM8K test mixture (~29.6K rows)
-        val_dataset = TaskMixture([
-            SmolTalk(split="test"), # 24K rows
-            MMLU(subset="all", split="test", stop=5200), # 5.2K (truncated to match PT ratios)
-            GSM8K(subset="main", split="test", stop=420), # 0.42K (truncated)
-        ])
+    # Val dataset: SmolTalk + MMLU + GSM8K test mixture (~29.6K rows)
+    val_dataset = TaskMixture([
+        SmolTalk(split="test"), # 24K rows
+        MMLU(subset="all", split="test", stop=5200), # 5.2K (truncated to match PT ratios)
+        GSM8K(subset="main", split="test", stop=420), # 0.42K (truncated)
+    ])
     _print0(f"Val mixture: {len(val_dataset):,} rows")
 
     if len(train_dataset) == 0:
@@ -735,7 +713,7 @@ def main() -> int:
         )
 
     # ---------------------------------------------------------------------
-    # Data generators (PT chat_sft.py:307-308 mirror)
+    # Data generators (mirrors upstream chat_sft.py)
     # ---------------------------------------------------------------------
     train_state = {"last_step": False, "approx_progress": 0.0, "current_epoch": 1}
     train_loader = sft_data_generator_bos_bestfit(
@@ -780,7 +758,7 @@ def main() -> int:
         _print0("Built train_step_fn")
 
     # ---------------------------------------------------------------------
-    # Training loop (PT chat_sft.py:337-498 mirror, simplified)
+    # Training loop (mirrors upstream chat_sft.py, simplified)
     # ---------------------------------------------------------------------
     progress = 0.0 # monotonic
     min_val_bpb = float("inf")
@@ -879,7 +857,7 @@ def main() -> int:
                 _print0(f"WARNING: evaluate_bpb failed ({e}). Skipping eval.")
                 val_bpb = None
 
-        # Periodic ChatCORE eval (PT chat_sft.py:363-397 mirror).
+        # Periodic ChatCORE eval (mirrors upstream chat_sft.py).
         if args.chatcore_every > 0 and (
             train_state["last_step"] or (step > 0 and step % args.chatcore_every == 0)
         ):
@@ -978,7 +956,7 @@ def main() -> int:
                     "mmlu_epochs": args.mmlu_epochs,
                     "gsm8k_epochs": args.gsm8k_epochs,
                     "batch_semantics": asdict(batch_semantics),
-                    "grad_accum_impl": args.grad_accum_impl,
+                    "grad_accum_impl": "loop",
                 },
                 "raw_user_config": raw_user_config,
                 "user_config": resolved_user_config,

@@ -14,9 +14,6 @@ There are two tasks in this file:
 
 (1) is the goal, but (2) exists as a highly condensed version of the part
 that makes (1) difficult, which is word spelling.
-
-To preview a few example conversations, run:
-python -m nanochat_jax.tasks.spellingbee
 """
 
 import random
@@ -89,6 +86,10 @@ USER_MSG_TEMPLATES = [
     "{word}里有几个{letter}",
     "数一下{word}中的{letter}",
     "{word}这个词里有多少{letter}",
+    # NOTE: intentional divergence from upstream, kept to preserve the
+    # published SFT reproduction (see dev/REPRODUCTION-GUARDS.md). Upstream
+    # also has 4 Korean templates here; this port was trained without them,
+    # so adding them now would change the SFT data augmentation stream.
     # French
     "Combien de {letter} dans {word}",
     "Combien de fois {letter} apparaît dans {word}",

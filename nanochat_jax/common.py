@@ -65,8 +65,9 @@ def download_file_with_lock(url: str, filename: str, postprocess_fn=None) -> str
 
     Idempotent across ranks: if the file already exists the function returns
     immediately. Uses ``fcntl.flock`` (Unix only). The optional ``postprocess_fn``
-    runs on the downloaded path while the lock is still held, which lets
-    callers atomically extract or move the file before other ranks observe it.
+    runs on the downloaded path while the lock is still held, so ranks waiting
+    on the lock observe its effects; note the fast-path existence check means
+    ranks arriving after the download see the file, not the postprocess run.
     """
     import fcntl  # Unix only
 

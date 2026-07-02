@@ -14,7 +14,8 @@ Working 50 minutes, she earned 0.2 x 50 = $<<0.2*50=10>>10.
 
 Notice that GSM8K uses tool calls inside << >> tags.
 
-PT 1:1 mirror — substitution 0 (algorithm framework-agnostic, datasets lib only).
+1:1 port of upstream ``tasks/gsm8k.py`` — the task logic is framework-agnostic
+(only the ``datasets`` library is used), so it is unchanged from PyTorch nanochat.
 """
 
 import re

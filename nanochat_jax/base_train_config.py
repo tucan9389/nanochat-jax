@@ -12,43 +12,13 @@ from nanochat_jax.gpt import GPTConfig
 
 
 B_REF_TOKENS = 2**19
+# muP D_ref: the d12 reference scaling-param count (transformer_matrices + lm_head of
+# ``make_config(depth=12)``, n_embd=768) used in the T_epoch weight-decay scaling. Kept
+# as a constant rather than computed live because JAX has no free meta device, so
+# instantiating a d12 model on every run would waste time/HBM (risky next to the d24
+# model). ``test_d12_scaling_params_constant_matches_live_config`` proves this equals a
+# live ``make_config(depth=12)`` count, so it cannot silently drift.
 D12_SCALING_PARAMS = 110_100_912
-
-
-def make_d12_config(
-    *,
-    depth: int = 12,
-    sequence_len: int = 2048,
-    vocab_size: int = 32768,
-    n_head: int = 6,
-    n_kv_head: int = 6,
-    n_embd: int = 768,
-    window_pattern: str = "SSSL",
-    bf16: bool = True,
-    attn_impl: str = "xla",
-    lm_head_precision: str | None = None,
-    splash_block_q: int | None = None,
-    splash_block_kv: int | None = None,
-    splash_block_kv_compute: int | None = None,
-    ve_grad_impl: str = "scatter",
-) -> GPTConfig:
-    """Legacy d12-style config preserved for existing smoke/golden tests."""
-    return GPTConfig(
-        sequence_len=sequence_len,
-        vocab_size=vocab_size,
-        n_layer=depth,
-        n_head=n_head,
-        n_kv_head=n_kv_head,
-        n_embd=n_embd,
-        window_pattern=window_pattern,
-        compute_dtype=jnp.bfloat16 if bf16 else jnp.float32,
-        attn_impl=attn_impl,
-        lm_head_precision=lm_head_precision,
-        splash_block_q=splash_block_q,
-        splash_block_kv=splash_block_kv,
-        splash_block_kv_compute=splash_block_kv_compute,
-        ve_grad_impl=ve_grad_impl,
-    )
 
 
 def make_config(
@@ -129,7 +99,11 @@ def compute_weight_decay_scaled(
     d12_scaling_params: int = D12_SCALING_PARAMS,
     b_ref_tokens: int = B_REF_TOKENS,
 ) -> float:
-    """T_epoch-style WD scaling used by the JAX base train script."""
+    """T_epoch-style WD scaling: ``wd * sqrt(B/B_ref) * (D_ref / D_target)``.
+
+    ``d12_scaling_params`` is the muP D_ref (defaults to the d12 reference
+    ``D12_SCALING_PARAMS``); ``d_x_scaling_params`` is the current model's D_target.
+    """
     batch_lr_scale = compute_batch_lr_scale(
         total_batch_size_tokens,
         b_ref_tokens=b_ref_tokens,
@@ -158,4 +132,4 @@ def resolve_num_iterations(
             f"(target_tokens={target_tokens:,}, scaling_params={int(scaling_params):,})"
         )
         return resolved, source
-    return int(default_num_iterations), "default 100 "
+    return int(default_num_iterations), "default 100"

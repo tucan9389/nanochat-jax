@@ -5,7 +5,7 @@ A 1-D ``("data",)`` mesh is sufficient for single-host TPU pods like v6e-8.
 scope for this port. The Muon optimizer's stacked momentum buffer is sharded
 along its first axis, which the GSPMD partitioner translates into the
 ``reduce_scatter`` / ``all_gather`` collectives that PyTorch's
-``CustomDistributedAdamW`` issues by hand.
+``DistMuonAdamW`` issues by hand.
 """
 
 from __future__ import annotations
@@ -99,7 +99,7 @@ def muon_state_sharding(
     - ``state.muon[k]["momentum_buffer" | "second_momentum_buffer"]`` ->
       sharded along axis 0 (the stacked params). The GSPMD partitioner then
       generates the same ``reduce_scatter`` + ``all_gather`` traffic that
-      PyTorch's ``CustomDistributedAdamW`` Muon path issues by hand.
+      PyTorch's ``DistMuonAdamW`` Muon path issues by hand.
 
     If a group's stacked size is not a multiple of the mesh size, that
     group's buffers fall back to replicated (avoiding ``IndivisibleError``).

@@ -32,7 +32,6 @@ class NanochatLinear(nnx.Module):
         out_features: int,
         *,
         weight_dtype: jnp.dtype = jnp.float32,
-        compute_dtype: jnp.dtype = jnp.bfloat16,
         kernel_init: Callable = nnx.initializers.lecun_normal(),
         kernel_axes: tuple[str | None, ...] | None = None,
         precision: jax.lax.PrecisionLike = None,
@@ -58,8 +57,6 @@ class NanochatLinear(nnx.Module):
 
         self.in_features = in_features
         self.out_features = out_features
-        self.weight_dtype = weight_dtype
-        self.compute_dtype = compute_dtype
         self.kernel_axes = kernel_axes
         self.precision = precision
         self.dot_general = dot_general

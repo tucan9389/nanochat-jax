@@ -27,8 +27,10 @@ def compute_loss_and_grad(
     gradient is returned as a flat dict keyed for direct comparison.
 
     Forward uses no PRNG, so the result is deterministic given the model
-    state, ``idx``, and ``targets``. ``Param`` leaves stay fp32; only the
-    forward activations follow ``cfg.compute_dtype``.
+    state, ``idx``, and ``targets``. With the default init, ``Param`` leaves
+    stay fp32 and only the forward activations follow ``cfg.compute_dtype``
+    (the opt-in ``init_weights(cast_embeddings_to_compute_dtype=True)`` path
+    stores wte/value_embeds — and hence their grads — in bf16).
     """
     def loss_fn(m: GPT) -> jax.Array:
         return m(idx, targets=targets)
@@ -71,9 +73,10 @@ def nnx_state_to_flat_dict(state: nnx.statelib.State) -> dict[str, jax.Array]:
 def grad_dict_dtype_summary(grad_dict: dict[str, jax.Array]) -> dict[str, int]:
     """Return a count of keys per dtype string (e.g. ``{"float32": 32}``).
 
-    On the JAX side every gradient is fp32 because ``Param`` leaves stay fp32
-    even with ``compute_dtype=bf16``. PyTorch-side references may be mixed
-    (bf16 for embeddings cast to compute dtype, fp32 elsewhere); use
+    With the default init every JAX-side gradient is fp32 because ``Param``
+    leaves stay fp32 even with ``compute_dtype=bf16`` (the opt-in bf16-emb
+    cast is the exception). PyTorch-side references may be mixed (bf16 for
+    embeddings cast to compute dtype, fp32 elsewhere); use
     :func:`cast_grad_dict_to_fp32` to align before comparing.
     """
     counts: dict[str, int] = {}
@@ -84,7 +87,7 @@ def grad_dict_dtype_summary(grad_dict: dict[str, jax.Array]) -> dict[str, int]:
 
 
 def cast_grad_dict_to_fp32(
-    grad_dict: dict[str, jnp.ndarray | "object"],
+    grad_dict: dict[str, jnp.ndarray],
 ) -> dict[str, jax.Array]:
     """Cast every gradient to ``jnp.float32``.
 

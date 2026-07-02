@@ -2,7 +2,8 @@
 The ARC dataset from Allen AI.
 https://huggingface.co/datasets/allenai/ai2_arc
 
-PT 1:1 mirror — substitution 0 (algorithm framework-agnostic, datasets lib only).
+1:1 port of upstream ``tasks/arc.py`` — the task logic is framework-agnostic
+(only the ``datasets`` library is used), so it is unchanged from PyTorch nanochat.
 """
 
 from datasets import load_dataset

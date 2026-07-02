@@ -3,7 +3,7 @@
 Cross-verified against:
 - NVIDIA H100 / A100 datasheets (dense BF16 with FP32 accumulate)
 - Google Cloud TPU docs (per-chip BF16 throughput)
-- Levanter ``flop_utils.py`` (Mosaic Composer extension)
+- Levanter ``flop_utils.py`` (Stanford CRFM's JAX trainer)
 - JAX scaling book (TPUs / GPUs chapters)
 - karpathy/nanochat ``common.py::get_peak_flops``
 """

@@ -32,7 +32,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from nanochat_jax.base_train import ( # noqa: E402 — sys.path mutation above
+from nanochat_jax.train_core import ( # noqa: E402 — sys.path mutation above
     get_lr_multiplier,
     get_muon_momentum,
     get_weight_decay,
@@ -47,13 +47,12 @@ from nanochat_jax.base_train_config import ( # noqa: E402
     compute_total_batch_size_tokens,
     compute_weight_decay_scaled,
     make_config,
-    make_d12_config,
     resolve_num_iterations,
 )
 from nanochat_jax.common import get_base_dir, setup_distributed_env_vars # noqa: E402
 from nanochat_jax.gpt import GPT # noqa: E402
 from nanochat_jax.grad_utils import nnx_state_to_flat_dict # noqa: E402
-from nanochat_jax.loss_eval import evaluate_bpb # noqa: E402 —
+from nanochat_jax.loss_eval import evaluate_bpb # noqa: E402
 from nanochat_jax.perf import compute_mfu, get_peak_bf16_tflops # noqa: E402
 from nanochat_jax.report import log_report_safe # noqa: E402
 from nanochat_jax.sharding import get_process_info, make_mesh # noqa: E402
@@ -64,16 +63,12 @@ def make_synthetic_batch(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Generate ``(idx, targets)`` synthetic random tokens.
 
-     cascade pattern (random data, deterministic seed). Returns numpy int64
-    arrays of shape ``(batch_size, seq_len)``; caller converts to JAX arrays.
-
-    Phase 5 atomic scope uses synthetic data (PLAN §3.7 ):
-
-    - Real ClimbMix dataloader integration is ✅ Done but cross-rank token
-      ordering for M6 metric is sensitive to rank-stride ( row-group
-      sharding). Synthetic random data lets us isolate **sharding numerical
-      correctness** from data ordering effects.
-    - (M7 BPB) will use real dataloader.
+    Deterministic given the seed. Returns numpy int64 arrays of shape
+    ``(batch_size, seq_len)``; caller converts to JAX arrays. Synthetic random
+    data is the default (pass ``--use-real-data`` for the real ClimbMix
+    dataloader); it lets a smoke run exercise the full training path without a
+    dataset download and isolates sharding / numerical correctness from data
+    ordering effects.
 
     Returns ``(idx, targets)`` where ``idx[i, t] = tokens[i, t]`` and
     ``targets[i, t] = tokens[i, t+1]`` (next-token prediction, PT mirror).
@@ -88,14 +83,14 @@ def save_weights(model: GPT, path: str) -> None:
     Uses :func:`nnx_state_to_flat_dict` to produce a flat
     string-keyed dict matching weight_converter format. The .npz can be
     loaded by :func:`numpy.load` and compared element-wise across runs
-    (single-host vs multi-host) to compute per-step weights diff for M6.
+    (single-host vs multi-host) to compute the per-step weights diff.
     """
     params_state = nnx.state(model, nnx.Param)
     flat_dict = nnx_state_to_flat_dict(params_state)
     np_dict = {k: np.asarray(v) for k, v in flat_dict.items()}
-    # Sanitize keys: numpy savez silently rewrites '.' to '_' but we want the
-    # original keys so M6 comparison can use the same names. We use savez with
-    # a wrapping function and explicit keyword rebind.
+    # Keys are mangled ('.' -> '__') before savez and restored by
+    # ``restore_key`` on load. The mangling predates this file's readers and is
+    # kept so old and new .npz dumps stay key-compatible with each other.
     np.savez(path, **{_safe_key(k): v for k, v in np_dict.items()})
 
 
@@ -113,7 +108,7 @@ def restore_key(safe_k: str) -> str:
 def _rolling_delete_old_checkpoints(
     checkpoint_dir: str, *, keep_last: int = 2
 ) -> int:
-    """Keep only the last N checkpoints to prevent disk full (T06 fix).
+    """Keep only the last N checkpoints to prevent disk full.
 
     Looks for ``model_<step:06d>.pt`` files in ``checkpoint_dir`` and removes
     the oldest, keeping ``keep_last`` newest. Also removes corresponding
@@ -164,58 +159,60 @@ def _rolling_delete_old_checkpoints(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="multi-TPU training + full pretrain")
-    parser.add_argument("--depth", type=int, default=12, help="Model depth (n_layer)")
-    # : generalize d24 config (aspect_ratio + head_dim)
-    parser.add_argument(
-        "--use-pt-mirror-config", action="store_true",
-        help=" : use PT 1:1 mirror build_model_meta (aspect_ratio + head_dim). "
-        "Default: backward-compat to make_d12_config (n_embd=768 hardcoded for / cascade).",
-    )
-    parser.add_argument(
+    parser = argparse.ArgumentParser(description="Pretrain the base model")
+    g_model = parser.add_argument_group("model")
+    g_batch = parser.add_argument_group("batch / training horizon")
+    g_opt = parser.add_argument_group("optimizer / schedule")
+    g_prec = parser.add_argument_group("precision")
+    g_attn = parser.add_argument_group("attention / TPU kernels")
+    g_data = parser.add_argument_group("data / evaluation")
+    g_ckpt = parser.add_argument_group("checkpointing / resume")
+    g_run = parser.add_argument_group("run control / logging")
+    g_dev = parser.add_argument_group("developer / debugging")
+    g_model.add_argument("--depth", type=int, default=12, help="Model depth (n_layer)")
+    g_model.add_argument(
         "--aspect-ratio", type=int, default=64,
-        help=" : with --use-pt-mirror-config, n_embd = depth * aspect_ratio "
-        "(rounded to head_dim multiple). Karpathy default 64. d24 → n_embd=1536.",
+        help="n_embd = depth * aspect_ratio (rounded up to a head_dim multiple). "
+        "Karpathy default 64. d24 → n_embd=1536.",
     )
-    parser.add_argument(
+    g_model.add_argument(
         "--head-dim", type=int, default=128,
-        help=" : with --use-pt-mirror-config, target head dimension. "
-        "Karpathy default 128.",
+        help="Target head dimension. Karpathy default 128.",
     )
-    parser.add_argument(
+    g_attn.add_argument(
         "--attn-impl", type=str, default="xla", choices=["xla", "splash"],
         help="Attention implementation. "
         "'xla' (default) = jax.nn.dot_product_attention(implementation='xla') "
         "; 'splash' = Splash Attention TPU kernel.",
     )
-    parser.add_argument(
+    g_batch.add_argument(
         "--num-iterations", type=int, default=-1,
         help="Total training steps. -1 = use --target-param-data-ratio. "
-        "/ backward-compat: explicit positive value overrides ratio.",
+        "An explicit positive value overrides the ratio.",
     )
-    # : auto num_iterations from target_param_data_ratio
-    parser.add_argument(
+    # Auto num_iterations from target_param_data_ratio.
+    g_batch.add_argument(
         "--target-param-data-ratio", type=float, default=-1.0,
-        help=" : target tokens / num_scaling_params ratio. -1 = disabled. "
+        help="Target tokens / num_scaling_params ratio. -1 = disabled. "
         "Karpathy Run 1 d24 = 12 (Chinchilla=20). target_tokens = ratio * "
         "num_scaling_params (transformer_matrices + lm_head, PT 1:1 mirror). "
         "num_iterations = target_tokens // total_batch_size.",
     )
-    parser.add_argument(
+    g_batch.add_argument(
         "--device-batch-size", type=int, default=4, help="Per-device batch size"
     )
-    parser.add_argument(
+    g_batch.add_argument(
         "--total-batch-size", type=int, default=-1,
-        help=" : total batch size in tokens. -1 = device_batch_size × seq_len × "
+        help="Total batch size in tokens. -1 = device_batch_size × seq_len × "
         "jax.device_count × grad_accum_steps. Karpathy d24 default = 524,288 (B_REF). "
         "Used to compute num_iterations from target_tokens.",
     )
-    parser.add_argument(
+    g_batch.add_argument(
         "--grad-accum-steps", type=int, default=1,
-        help=" : gradient accumulation steps. Default 1. "
+        help="Gradient accumulation steps. Default 1. "
         "Use >1 when per-device batch is smaller than the target token batch.",
     )
-    parser.add_argument(
+    g_batch.add_argument(
         "--grad-accum-impl",
         type=str,
         default="loop",
@@ -224,52 +221,49 @@ def main() -> int:
         "per-microbatch JIT path; 'fused' scans microbatches and applies the "
         "optimizer inside one JIT call.",
     )
-    parser.add_argument("--seq-len", type=int, default=2048, help="Sequence length")
-    parser.add_argument("--vocab-size", type=int, default=32768)
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument(
+    g_model.add_argument("--seq-len", type=int, default=2048, help="Sequence length")
+    g_model.add_argument("--vocab-size", type=int, default=32768)
+    g_run.add_argument("--seed", type=int, default=42, help="Random seed")
+    g_run.add_argument(
         "--dry-run",
         action="store_true",
         help="Initialize mesh + model + optimizer + dataloader, then exit. "
         "Useful for cheap end-to-end smoke tests on TPU.",
     )
-    parser.add_argument("--warmup-steps", type=int, default=40)
-    parser.add_argument("--warmdown-ratio", type=float, default=0.65)
-    parser.add_argument("--final-lr-frac", type=float, default=0.05)
-    parser.add_argument("--weight-decay", type=float, default=0.28) # Karpathy default; code scales → ~0.042 for d24
-    # : explicit lr/wd args for Karpathy mirror (defaults match
-    # nanochat_jax.base_train.init_train_state — / regression preserved).
-    parser.add_argument(
+    g_opt.add_argument("--warmup-steps", type=int, default=40)
+    g_opt.add_argument("--warmdown-ratio", type=float, default=0.65)
+    g_opt.add_argument("--final-lr-frac", type=float, default=0.05)
+    g_opt.add_argument("--weight-decay", type=float, default=0.28) # Karpathy default; code scales → ~0.042 for d24
+    # Explicit lr/wd args (defaults match nanochat_jax.train_core.init_train_state).
+    g_opt.add_argument(
         "--matrix-lr", type=float, default=0.02,
-        help=" : Muon LR for matrix params. Karpathy default 0.02.",
+        help="Muon LR for matrix params. Karpathy default 0.02.",
     )
-    parser.add_argument(
-        "--embedding-lr", type=float, default=0.2,
-        help=" : Adam LR for token embedding. nanochat init_train_state "
-        "default 0.2. Karpathy d24 default = 0.3 .",
+    g_opt.add_argument(
+        "--embedding-lr", type=float, default=0.3,
+        help="Adam LR for the token embedding (the d24 recipe value).",
     )
-    parser.add_argument(
-        "--unembedding-lr", type=float, default=0.004,
-        help=" : Adam LR for lm_head. nanochat init_train_state default "
-        "0.004. Karpathy d24 default = 0.008 .",
+    g_opt.add_argument(
+        "--unembedding-lr", type=float, default=0.008,
+        help="Adam LR for the lm_head (the d24 recipe value).",
     )
-    parser.add_argument(
+    g_opt.add_argument(
         "--scalar-lr", type=float, default=0.5,
-        help=" : Adam LR for scalar params. Karpathy default 0.5.",
+        help="Adam LR for scalar params. Karpathy default 0.5.",
     )
-    parser.add_argument(
+    g_dev.add_argument(
         "--weights-out",
         type=str,
         default=None,
         help="Optional final weights .npz path.",
     )
-    parser.add_argument(
+    g_dev.add_argument(
         "--per-step-weights-out",
         type=str,
         default=None,
         help="Optional dir for per-step weights .npz snapshots.",
     )
-    parser.add_argument(
+    g_dev.add_argument(
         "--save-every",
         type=int,
         default=1,
@@ -277,19 +271,19 @@ def main() -> int:
         "Step 0 + final step always saved. Use 50 for {0, 50, 99} sample only "
         "(suitable for d12 large model where per-step disk = ~60-100GB).",
     )
-    parser.add_argument(
+    g_run.add_argument(
         "--no-distributed",
         action="store_true",
         help="Skip jax.distributed.initialize (CPU dry run)",
     )
-    parser.add_argument(
+    g_prec.add_argument(
         "--bf16",
         action="store_true",
         default=True,
-        help="Use bf16 compute (default; cascade). --no-bf16 disables.",
+        help="Use bf16 compute (default). --no-bf16 disables.",
     )
-    parser.add_argument("--no-bf16", dest="bf16", action="store_false")
-    parser.add_argument(
+    g_prec.add_argument("--no-bf16", dest="bf16", action="store_false")
+    g_prec.add_argument(
         "--cast-embeddings-bf16",
         action="store_true",
         default=False,
@@ -297,7 +291,7 @@ def main() -> int:
         "In bf16 mode this keeps embeddings and optimizer state in the same "
         "precision regime as the PyTorch reference path.",
     )
-    parser.add_argument(
+    g_prec.add_argument(
         "--polar-express-bf16",
         action="store_true",
         default=False,
@@ -306,7 +300,7 @@ def main() -> int:
     )
     # TPU default fp32 matmul can use bf16 internal accumulation. ``highest``
     # requests a slower, higher-accuracy accumulation path when needed.
-    parser.add_argument(
+    g_prec.add_argument(
         "--matmul-precision",
         type=str,
         default=None,
@@ -315,7 +309,7 @@ def main() -> int:
         "TPU default = bf16 internal acc (Fastest). 'highest' = 6-pass bf16 "
         "= near-fp32 acc (~2.5x slower).",
     )
-    parser.add_argument(
+    g_prec.add_argument(
         "--lm-head-precision",
         type=str,
         default=None,
@@ -323,128 +317,128 @@ def main() -> int:
         help="Override only the lm_head dot_general precision while leaving "
         "global matmul precision unchanged.",
     )
-    parser.add_argument(
+    g_attn.add_argument(
         "--splash-block-q",
         type=int,
         default=None,
         help="Splash Attention block_q override. None keeps Splash defaults.",
     )
-    parser.add_argument(
+    g_attn.add_argument(
         "--splash-block-kv",
         type=int,
         default=None,
         help="Splash Attention block_kv override. None keeps Splash defaults.",
     )
-    parser.add_argument(
+    g_attn.add_argument(
         "--splash-block-kv-compute",
         type=int,
         default=None,
         help="Splash Attention block_kv_compute override. None uses min(block_kv, 128).",
     )
-    parser.add_argument(
+    g_attn.add_argument(
         "--ve-grad-impl",
         type=str,
         default="scatter",
-        choices=["scatter", "onehot", "segsum", "segsum_fp32"],
+        choices=["scatter", "onehot"],
         help="Value-embedding backward implementation. Default scatter is the "
         "baseline; onehot can improve TPU throughput at large vocab/sequence shapes.",
     )
-    parser.add_argument(
+    g_run.add_argument(
         "--log-every",
         type=int,
         default=10,
         help="Log every N steps (master process only).",
     )
-    # (Phase 5 fifth sub-feature) -- val BPB measurement
-    parser.add_argument(
+    # val BPB measurement
+    g_data.add_argument(
         "--use-real-data",
         action="store_true",
-        help=": use real ClimbMix dataloader instead of synthetic random batches "
+        help="Use real ClimbMix dataloader instead of synthetic random batches "
         "(default: synthetic). Required for meaningful quality evaluation.",
     )
-    parser.add_argument(
+    g_data.add_argument(
         "--eval-only",
         action="store_true",
-        help=": skip training (num_iterations forced to 0) and run val BPB "
+        help="Skip training (num_iterations forced to 0) and run val BPB "
         "evaluation only on randomly-initialized weights. Use for sanity checks.",
     )
-    parser.add_argument(
+    g_data.add_argument(
         "--eval-steps",
         type=int,
         default=20,
-        help=": number of val batches for BPB measurement .",
+        help="Number of val batches for BPB measurement.",
     )
-    parser.add_argument(
+    g_data.add_argument(
         "--bpb-out",
         type=str,
         default=None,
-        help=": path for val BPB JSON result (master process only). "
-        "If None, BPB measurement is skipped .",
+        help="Path for val BPB JSON result (master process only). "
+        "If None, BPB measurement is skipped.",
     )
-    # : intermediate checkpoint + resume
-    parser.add_argument(
+    # intermediate checkpoint + resume
+    g_ckpt.add_argument(
         "--checkpoint-every", type=int, default=-1,
-        help=" : save intermediate checkpoint every N steps. -1 = disabled "
+        help="Save an intermediate checkpoint every N steps. -1 = disabled "
         "(only final saved if --checkpoint-dir set). 2000 recommended for spot "
         "preemption safety.",
     )
-    parser.add_argument(
+    g_ckpt.add_argument(
         "--keep-last-checkpoints", type=int, default=2,
         help="Keep only the last N intermediate checkpoints. Default 2 bounds "
         "disk usage during long spot runs.",
     )
-    parser.add_argument(
+    g_ckpt.add_argument(
         "--resume-from-step", type=int, default=-1,
-        help=" : resume training from step N checkpoint. -1 = disabled (start "
+        help="Resume training from the step-N checkpoint. -1 = disabled (start "
         "fresh). Loads model + optim_state + dataloader_state + loop_state from "
         "checkpoint_dir.",
     )
-    parser.add_argument(
+    g_ckpt.add_argument(
         "--stop-after-step",
         type=int,
         default=-1,
         help="Stop after completing this train step. -1 disables.",
     )
-    parser.add_argument(
+    g_ckpt.add_argument(
         "--no-final-checkpoint",
         action="store_true",
         help="Suppress the final/stop checkpoint. Periodic --checkpoint-every "
         "checkpoints still fire.",
     )
-    parser.add_argument(
+    g_ckpt.add_argument(
         "--checkpoint-dir", type=str, default=None,
-        help=" : directory for intermediate + final checkpoints. Default = "
+        help="Directory for intermediate + final checkpoints. Default = "
         "get_base_dir()/base_checkpoints/{model_tag} if model_tag given.",
     )
-    parser.add_argument(
+    g_ckpt.add_argument(
         "--model-tag", type=str, default=None,
-        help=" : model tag for checkpoint dir name. Default = "
+        help="Model tag for the checkpoint dir name. Default = "
         "'d{depth}_jax_seed{seed}' if not given.",
     )
-    # : periodic val_bpb measurement during training
-    parser.add_argument(
+    # periodic val_bpb measurement during training
+    g_data.add_argument(
         "--eval-every", type=int, default=0,
-        help=" : evaluate val_bpb every N steps. 0 = disabled (default). "
+        help="Evaluate val_bpb every N steps. 0 = disabled (default). "
         "250 = Karpathy default. Checkpoint always saved BEFORE eval runs.",
     )
-    parser.add_argument(
+    g_data.add_argument(
         "--eval-tokens", type=int, default=80 * 524_288,
-        help=" : number of tokens per validation eval. Karpathy default "
+        help="Number of tokens per validation eval. Karpathy default "
         "80 * 524288 = 41,943,040. eval_steps = eval_tokens // (device_batch * seq_len * device_count).",
     )
-    parser.add_argument(
+    g_data.add_argument(
         "--no-final-eval", action="store_true",
-        help=" : suppress the forced final-step val_bpb eval that the "
+        help="Suppress the forced final-step val_bpb eval that the "
         "periodic-eval branch fires unconditionally on is_last_step. Periodic "
         "evals at multiples of --eval-every continue to fire. No effect when "
         "--eval-every=0. Saves ~5-40 min of duplicate eval when an external "
         "base_eval.py pass runs after training.",
     )
-    parser.add_argument(
+    g_data.add_argument(
         "--token-bytes-path",
         type=str,
         default=None,
-        help=": explicit path to token_bytes.npy. If None, uses "
+        help="Explicit path to token_bytes.npy. If None, uses "
         "``nanochat_jax.tokenizer.get_token_bytes`` (default tokenizer dir).",
     )
     args = parser.parse_args()
@@ -494,40 +488,23 @@ def main() -> int:
             f"ve_grad_impl={args.ve_grad_impl}"
         )
 
-    # 3. config + model init (deterministic seed). generalize:
-    # --use-pt-mirror-config activates make_config (aspect_ratio + head_dim).
-    # Default = make_d12_config for backward-compat with / regression
-    # (n_embd=768 hardcoded for any depth).
-    if args.use_pt_mirror_config:
-        # path: PT 1:1 mirror of build_model_meta
-        config = make_config(
-            depth=args.depth,
-            aspect_ratio=args.aspect_ratio,
-            head_dim=args.head_dim,
-            sequence_len=args.seq_len,
-            vocab_size=args.vocab_size,
-            bf16=args.bf16,
-            attn_impl=args.attn_impl,
-            lm_head_precision=args.lm_head_precision,
-            splash_block_q=args.splash_block_q,
-            splash_block_kv=args.splash_block_kv,
-            splash_block_kv_compute=args.splash_block_kv_compute,
-            ve_grad_impl=args.ve_grad_impl,
-        )
-    else:
-        # / backward-compat (n_embd=768 hardcoded)
-        config = make_d12_config(
-            depth=args.depth,
-            sequence_len=args.seq_len,
-            vocab_size=args.vocab_size,
-            bf16=args.bf16,
-            attn_impl=args.attn_impl,
-            lm_head_precision=args.lm_head_precision,
-            splash_block_q=args.splash_block_q,
-            splash_block_kv=args.splash_block_kv,
-            splash_block_kv_compute=args.splash_block_kv_compute,
-            ve_grad_impl=args.ve_grad_impl,
-        )
+    # 3. model config + init (deterministic seed). Single sizing path mirroring
+    # upstream build_model_meta: n_embd = ceil(depth*aspect_ratio/head_dim)*head_dim
+    # (d24 → n_embd=1536). MHA, so n_kv_head == n_head.
+    config = make_config(
+        depth=args.depth,
+        aspect_ratio=args.aspect_ratio,
+        head_dim=args.head_dim,
+        sequence_len=args.seq_len,
+        vocab_size=args.vocab_size,
+        bf16=args.bf16,
+        attn_impl=args.attn_impl,
+        lm_head_precision=args.lm_head_precision,
+        splash_block_q=args.splash_block_q,
+        splash_block_kv=args.splash_block_kv,
+        splash_block_kv_compute=args.splash_block_kv_compute,
+        ve_grad_impl=args.ve_grad_impl,
+    )
     rngs = nnx.Rngs(args.seed)
     model = GPT(config, rngs=rngs)
     model.init_weights(
@@ -571,7 +548,7 @@ def main() -> int:
     if is_master:
         n_params = sum(int(np.prod(v.shape)) for v in nnx_state_to_flat_dict(nnx.state(model, nnx.Param)).values())
         print(f"[info] model params (Param leaves) = {n_params:,} ({n_params / 1e6:.2f}M)")
-        # : detailed param breakdown + scaling_params
+        # detailed param breakdown + scaling_params
         scaling_counts = _scaling_counts
         scaling_params = _d_x_scaling
         print(f"[info] scaling_params (transformer_matrices + lm_head) = {scaling_params:,} ({scaling_params/1e6:.2f}M)")
@@ -602,7 +579,7 @@ def main() -> int:
         polar_express_dtype=polar_express_dtype,
     )
 
-    # + : compute num_iterations (total_batch_size already above)
+    # Compute num_iterations (total_batch_size already resolved above).
     num_iterations, horizon_source = resolve_num_iterations(
         num_iterations=args.num_iterations,
         target_param_data_ratio=args.target_param_data_ratio,
@@ -656,12 +633,11 @@ def main() -> int:
     train_loader = None
     train_loader_state = None
     make_train_loader = None
-    val_loader = None
     tokenizer = None
     token_bytes = None
 
     if args.use_real_data or args.bpb_out is not None:
-        # : import lazily so synthetic-only runs don't pay the deps
+        # import lazily so synthetic-only runs don't pay the deps
         from nanochat_jax.dataloader import ( # noqa: E402
             tokenizing_distributed_data_loader_bos_bestfit,
             tokenizing_distributed_data_loader_with_state_bos_bestfit,
@@ -686,7 +662,7 @@ def main() -> int:
             )
 
     if args.use_real_data:
-        # : per-process dataloader. Each process_index streams a disjoint
+        # per-process dataloader. Each process_index streams a disjoint
         # rank shard of train shards. Batch size per device, but
         # the global batch is device_batch_size × jax.device_count across all
         # data-parallel devices. So **each process** yields B = device_batch_size
@@ -756,7 +732,7 @@ def main() -> int:
             f"({device_kind}), tokens/step = {tokens_per_step:,}"
         )
 
-    # : resolve checkpoint_dir
+    # resolve checkpoint_dir
     model_tag = args.model_tag or f"d{args.depth}_jax_seed{args.seed}"
     if args.checkpoint_dir is not None:
         checkpoint_dir = args.checkpoint_dir
@@ -772,7 +748,7 @@ def main() -> int:
         os.makedirs(checkpoint_dir, exist_ok=True)
         print(f"[info] checkpoint_dir = {checkpoint_dir} (model_tag={model_tag})")
 
-    # : resume from checkpoint (if requested)
+    # resume from checkpoint (if requested)
     start_step = 0
     if args.resume_from_step >= 0:
         if checkpoint_dir is None:
@@ -848,7 +824,7 @@ def main() -> int:
 
     num_iter = 0 if args.eval_only else num_iterations
 
-    # : periodic val_bpb eval setup (eval_steps + training_log)
+    # periodic val_bpb eval setup (eval_steps + training_log)
     eval_steps_periodic = 0
     if args.eval_every > 0:
         eval_steps_periodic = max(
@@ -867,7 +843,7 @@ def main() -> int:
         training_log_path = os.path.join(checkpoint_dir, "training_log.jsonl")
 
     def _eval_val_bpb_now(step: int) -> float | None:
-        """ : periodic val_bpb measurement during training (master + all hosts)."""
+        """Periodic val_bpb measurement during training (master + all hosts)."""
         if not args.use_real_data:
             return None
         per_process_val_batch = args.device_batch_size * max(local_device_count, 1)
@@ -877,7 +853,7 @@ def main() -> int:
         return float(evaluate_bpb(model, val_loader_eval, eval_steps_periodic, token_bytes))
 
     def _save_intermediate_checkpoint(step: int, val_bpb: float | None) -> None:
-        """ : save intermediate checkpoint (master only writes meta + model)."""
+        """Save an intermediate checkpoint (master only writes meta + model)."""
         if checkpoint_dir is None:
             return
         from nanochat_jax.checkpoint_manager import save_checkpoint
@@ -1068,17 +1044,15 @@ def main() -> int:
         loss_val = float(loss)
         if not np.isfinite(loss_val):
             raise ValueError(
-                f"Non-finite loss at step {step}: {loss_val} (NaN/Inf — "
-                f" Catastrophic, § reset criteria)"
+                f"Non-finite loss at step {step}: {loss_val} (NaN/Inf)"
             )
         if loss_val > 100.0:
             raise ValueError(
-                f"Loss explosion at step {step}: {loss_val} > 100 "
-                f""
+                f"Loss explosion at step {step}: {loss_val} > 100"
             )
         losses.append(loss_val)
 
-        # 7e. Per-step weights save (M6 metric, master only). Step 0 + final
+        # 7e. Per-step weights save (master only). Step 0 + final
         # always saved; intermediate steps every --save-every steps.
         if args.per_step_weights_out is not None and is_master:
             _sync_fused_model_state()
@@ -1093,7 +1067,7 @@ def main() -> int:
                 )
                 save_weights(model, step_path)
 
-        # 7f. Logging (master only, )
+        # 7f. Logging (master only)
         step_dt = time.time() - step_start_time
         if is_master and (step % args.log_every == 0 or step == num_iterations - 1):
             elapsed = time.time() - t0
@@ -1183,7 +1157,7 @@ def main() -> int:
         save_weights(model, args.weights_out)
         print(f"[info] Saved final weights to {args.weights_out}")
 
-    if is_master and num_iter > 0:
+    if is_master and losses:
         elapsed = time.time() - t0
         executed_steps = len(losses)
         print(
@@ -1194,7 +1168,7 @@ def main() -> int:
         print(f"[done] losses[-5:] = {losses[-5:]}")
         print(f"[done] final loss = {losses[-1]:.6f}")
 
-    # 9. : val BPB measurement (M7 trigger). Runs on master + all hosts;
+    # 9. val BPB measurement. Runs on master + all hosts;
     # ``evaluate_bpb`` does the cross-host all-reduce internally
     # (loss_eval.py:196+). PT mirror: base_train.py:421-435 final eval.
     final_bpb_report = None

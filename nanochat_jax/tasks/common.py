@@ -18,7 +18,7 @@ import random
 class Task:
     """Base class of a Task. Allows for lightweight slicing of the underlying dataset.
 
-    PT 1:1 mirror: ``nanochat/tasks/common.py:Task``.
+    1:1 mirror of upstream ``tasks/common.py:Task``.
     """
 
     def __init__(self, start: int = 0, stop: int | None = None, step: int = 1) -> None:
@@ -65,7 +65,7 @@ class Task:
 class TaskMixture(Task):
     """For SFT Training it becomes useful to train on a mixture of datasets.
 
-    PT 1:1 mirror: ``nanochat/tasks/common.py:TaskMixture``.
+    1:1 mirror of upstream ``tasks/common.py:TaskMixture``.
 
     Fun trick: if you wish to oversample any task, just pass it in multiple times in the list.
     Deterministic shuffle (seed=42) ensures tasks are mixed throughout training, regardless of
@@ -107,7 +107,7 @@ class TaskMixture(Task):
 class TaskSequence(Task):
     """For SFT Training sometimes we want to sequentially train on a list of tasks.
 
-    PT 1:1 mirror: ``nanochat/tasks/common.py:TaskSequence``.
+    1:1 mirror of upstream ``tasks/common.py:TaskSequence``.
 
     Useful for cases that require a training curriculum.
     """
@@ -137,7 +137,7 @@ class TaskSequence(Task):
 def render_mc(question: str, letters: tuple[str, ...], choices: list[str]) -> str:
     """The common multiple choice rendering format we will use.
 
-    PT 1:1 mirror: ``nanochat/tasks/common.py:render_mc``.
+    1:1 mirror of upstream ``tasks/common.py:render_mc``.
 
     Note two important design decisions:
 

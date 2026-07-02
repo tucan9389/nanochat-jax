@@ -52,6 +52,8 @@ def _log0(message: str) -> None:
 def _patch_missing_config_keys(model_config_kwargs: dict) -> None:
     """Add default values for new config keys missing in old checkpoints."""
     if "window_pattern" not in model_config_kwargs:
+        # Old checkpoints were trained with full context (no sliding window),
+        # so a missing window_pattern defaults to "L" (long / full).
         model_config_kwargs["window_pattern"] = "L"
         _log0("Patching missing window_pattern in model config to 'L'")
 
@@ -196,7 +198,7 @@ def build_model(
     """Build an NNX :class:`GPT` from a checkpoint, plus tokenizer + meta.
 
     The default ``compute_dtype=jnp.float32`` is the safe path; pass
-    ``jnp.bfloat16`` to opt into the bf16 forward cascade.
+    ``jnp.bfloat16`` to opt into the bf16 forward cast chain.
     """
     model_data, _, meta_data = load_checkpoint(
         checkpoint_dir, step, load_optimizer=False

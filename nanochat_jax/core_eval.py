@@ -4,8 +4,8 @@ Reference: https://arxiv.org/abs/2406.11794. CORE is upstream nanochat's
 primary metric ("time to GPT-2"), as recorded in ``dev/LEADERBOARD.md``.
 
 The forward pass is jit-cached per model instance and uses power-of-2 padding
-so the JIT cache amortizes across the ~22 ICL tasks: only ~7 unique
-``(B, T)`` shapes are compiled instead of one per example.
+so the JIT cache amortizes across the ~22 ICL tasks: only a handful of
+unique ``(B, T)`` shapes are compiled instead of one per example.
 """
 
 from __future__ import annotations
@@ -175,8 +175,8 @@ def _get_jitted_forward(model):
     """Return a JIT-compiled forward bound to ``model`` via closure.
 
     JIT amortizes TPU dispatch overhead across many examples. With power-of-2
-    padding the cache reduces ~2200 unique shapes (22 tasks * 100 examples)
-    to ~7, giving order-of-magnitude speedups on TPU spot runs.
+    padding the cache collapses thousands of unique shapes (22 tasks x N
+    examples) to a handful, giving order-of-magnitude speedups on TPU.
     """
     key = id(model)
     if key not in _jit_forward_cache:
@@ -236,7 +236,11 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     else:
         raise ValueError(f"Unsupported task type: {task_type}")
 
-    # Truncation for models with bounded sequence length.
+    # NOTE: intentional divergence from upstream, kept to preserve the
+    # published-d24 CORE score (see dev/REPRODUCTION-GUARDS.md). Our native
+    # model always has config.sequence_len, so prompts longer than it are
+    # ALWAYS cropped here; upstream only crops models that expose max_seq_len,
+    # which its native GPT does not — upstream never truncates.
     max_seq_len = getattr(getattr(model, "config", None), "sequence_len", None)
     if max_seq_len is not None:
         max_tokens = max_seq_len

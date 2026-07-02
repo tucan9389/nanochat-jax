@@ -66,7 +66,6 @@ def _all_reduce_sum(value: int) -> int:
 def run_generative_eval(
     task_object,
     tokenizer,
-    model,
     engine,
     num_samples: int,
     max_new_tokens: int,
@@ -77,7 +76,7 @@ def run_generative_eval(
 ):
     """Sample completions and evaluate via ``task_object.evaluate``.
 
-    PT mirror: ``nanochat/scripts/chat_eval.py:29-81``. JAX substitution:
+    Mirrors upstream ``chat_eval.py``; the JAX substitution is:
     ``torch.tensor + dist.all_reduce`` → ``jnp.asarray + multihost_utils.process_allgather``.
     """
     process_count = max(jax.process_count(), 1)
@@ -154,7 +153,7 @@ def run_categorical_eval(
 ):
     """Argmax over the available answer letters in a single forward pass.
 
-    PT mirror: ``nanochat/scripts/chat_eval.py:88-153``. JAX substitution:
+    Mirrors upstream ``chat_eval.py``; the JAX substitution is:
     ``torch.tensor + torch.no_grad + dist.all_reduce`` →
     ``jnp.asarray + jnp.argmax + multihost_utils.process_allgather``.
     """
@@ -300,7 +299,6 @@ def run_chat_eval(
         acc = run_generative_eval(
             task_object,
             tokenizer,
-            model,
             engine,
             num_samples,
             max_new_tokens,
@@ -355,7 +353,7 @@ def compute_chatcore(
 ) -> dict[str, float]:
     """Compute the ChatCORE metric (mean centered accuracy).
 
-    PT mirror: ``nanochat/scripts/chat_eval.py:236-244``.
+    Mirrors upstream ``chat_eval.py``.
 
     Returns ``{"ChatCORE metric": <float>}`` if all_tasks were evaluated, else ``{}``.
     """
@@ -378,7 +376,7 @@ def compute_chatcore(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """argparse 11 args PT 1:1 mirror (chat_eval.py:182-195)."""
+    """Build the chat_eval argument parser (mirrors upstream ``chat_eval.py``)."""
     parser = argparse.ArgumentParser(
         description="Evaluate the Chat model on 6 ICL tasks + ChatCORE metric."
     )
@@ -430,13 +428,6 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="First problem index to evaluate within each task (default: 0).",
-    )
-    parser.add_argument(
-        "--device-type",
-        type=str,
-        default="",
-        choices=["cuda", "cpu", "mps", ""],
-        help="Device type (PT compatibility — JAX-port is device-agnostic, ignored)",
     )
     parser.add_argument(
         "--out",
@@ -545,7 +536,7 @@ def main(argv: list[str] | None = None) -> int:
         results[task_name] = acc
         _print0(f"{task_name} accuracy: {100 * acc:.2f}%")
 
-    # ChatCORE metric (PT 1:1 mirror, only when all 6 tasks evaluated)
+    # ChatCORE metric (only when all 6 tasks were evaluated)
     chatcore_dict = compute_chatcore(results, all_tasks=ALL_TASKS)
 
     if _is_master():

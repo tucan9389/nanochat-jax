@@ -20,7 +20,7 @@ from nanochat_jax.tasks.common import Task
 class SmolTalk(Task):
     """ smol-smoltalk dataset. train is 460K rows, test is 24K rows.
 
-    PT 1:1 mirror: ``nanochat/tasks/smoltalk.py:SmolTalk``.
+    1:1 mirror of upstream ``tasks/smoltalk.py:SmolTalk``.
     """
 
     def __init__(self, split: str, **kwargs) -> None:

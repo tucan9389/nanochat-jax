@@ -19,7 +19,7 @@ from nanochat_jax.tasks.common import Task
 class CustomJSON(Task):
     """Load conversations from a JSONL file.
 
-    PT 1:1 mirror: ``nanochat/tasks/customjson.py:CustomJSON``.
+    1:1 mirror of upstream ``tasks/customjson.py:CustomJSON``.
 
     Each line should be a JSON array of message objects with 'role' and 'content' fields.
     Example line: ``[{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello"}]``

@@ -4,7 +4,7 @@ Upstream nanochat measures Time-to-GPT-2: training wall-clock time needed to bea
 
 ## Upstream nanochat (PyTorch + GPU)
 
-Excerpted from [`karpathy/nanochat/dev/LEADERBOARD.md`](https://github.com/karpathy/nanochat/blob/master/dev/LEADERBOARD.md):
+Excerpted from upstream nanochat's README summary table (the repo's dev/LEADERBOARD.md holds the fuller history):
 
 | # | time (h) | val_bpb | CORE | Description | Date | Commit | Contributors |
 |---|---:|---:|---:|---|---|---|---|
@@ -35,32 +35,24 @@ Row 1 config: `seq_len=2048`, `n_layer=24`, `n_embd=1536`, `n_head=12`, `524288`
 
 ## Reproduction reference
 
-`runs/speedrun.sh` is the reproduction path. A full validation run of this
-pipeline on v6e-8 spot (June 8 2026, surviving repeated spot preemptions via
-checkpoint resume) measured, at the same final step 16703:
+`runs/speedrun.sh` is the reproduction path. A full validation run of this pipeline on v6e-8 spot (June 8 2026, surviving repeated spot preemptions via checkpoint resume) measured, at the same final step 16703:
 
 | Metric | Row 1 (A100 eval) | Pipeline validation run (TPU eval, bf16) |
 |---|---:|---:|
 | CORE (22/22 tasks, `max_per_task=-1`) | 0.27409 | 0.27343 |
 | val_bpb | 0.71879 | 0.72258 |
 
-Both clear the GPT-2 reference CORE `0.2565`. The two columns are different
-training runs evaluated on different hosts, so treat deltas of this size
-(about `0.0007` CORE, `0.004` BPB) as the expected reproduction band rather
-than a regression. The validation run's measured steady-state rate was
-`1.39-1.44s/step` at about 24% MFU; the `1.58s/step` behind the row 1 time
-estimate is a conservative basis that includes checkpointing overhead.
+Both clear the GPT-2 reference CORE `0.2565`. The two columns are different training runs evaluated on different hosts, so treat deltas of this size (about `0.0007` CORE, `0.004` BPB) as the expected reproduction band rather than a regression. The validation run's measured steady-state rate was `1.39-1.44s/step` at about 24% MFU; the `1.58s/step` behind the row 1 time estimate is a conservative basis that includes checkpointing overhead.
+
+The shipped pipeline was last re-verified end-to-end on real hardware on July 2 2026 (v6e-8 spot, short run at the exact published d24 recipe): parameter count, scaling-param count, and muP weight decay matched this table exactly; training ran at `1.43s/step` / `23.7%` MFU on real data (consistent with the validation run above); checkpoint save/resume, base eval, SFT, ChatEval, and report generation all completed cleanly.
+
+These numbers ride on four small, intentional divergences from upstream nanochat that predate the published runs (decode-window off-by-one, CORE-eval prompt truncation, smear_gate init, SpellingBee SFT templates). "Fixing" any of them changes what this table (or the SFT section below) reproduces; each is documented in `dev/REPRODUCTION-GUARDS.md` and marked with a NOTE comment at its code site.
 
 ## Post-SFT categorical ChatEval
 
-SFT is validated per pipeline release, not per base leaderboard row: base rows
-can be re-run and appended above without re-running SFT, and this section only
-changes when a new SFT run completes.
+SFT is validated per pipeline release, not per base leaderboard row: base rows can be re-run and appended above without re-running SFT, and this section only changes when a new SFT run completes.
 
-The scores below come from the June 8 2026 pipeline validation run (the
-TPU-eval column above). Its final base checkpoint (step 16703) was fine-tuned
-on the full SFT mixture for 973 steps, and the saved SFT checkpoint was
-evaluated with `scripts.chat_eval` (`bfloat16`, all examples per task):
+The scores below come from the June 8 2026 pipeline validation run (the TPU-eval column above). Its final base checkpoint (step 16703) was fine-tuned on the full SFT mixture for 973 steps, and the saved SFT checkpoint was evaluated with `scripts.chat_eval` (`bfloat16`, all examples per task):
 
 | Task | Accuracy | Correct / Total |
 |---|---:|---:|
@@ -68,10 +60,7 @@ evaluated with `scripts.chat_eval` (`bfloat16`, all examples per task):
 | ARC-Challenge | 50.68% | 594 / 1172 |
 | MMLU | 37.08% | 5207 / 14042 |
 
-The generative ChatEval tasks (GSM8K, HumanEval, SpellingBee) are not part of
-this record: the current JAX generative eval path is too slow to complete them
-within the run budget, which is why the public default ChatEval is the
-categorical set.
+The generative ChatEval tasks (GSM8K, HumanEval, SpellingBee) are not part of this record: the current JAX generative eval path is too slow to complete them within the run budget, which is why the public default ChatEval is the categorical set.
 
 Cost calculations use v6e-8 spot as the primary basis. On-demand is listed only as a reference. Price snapshot: 2026-06-04 Google Cloud.
 

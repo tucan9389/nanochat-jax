@@ -357,9 +357,10 @@ class Report:
     def _write_summary_table(out, final_metrics: dict[str, dict[str, str]]) -> None:
         metrics = sorted(
             {key for values in final_metrics.values() for key in values},
+            # CORE first, ChatCORE last, rest alphabetical (upstream order)
             key=lambda key: (
                 key != "CORE metric",
-                key != "ChatCORE metric",
+                key == "ChatCORE metric",
                 key,
             ),
         )

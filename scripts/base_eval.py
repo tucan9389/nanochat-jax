@@ -93,188 +93,48 @@ def _build_parser() -> argparse.ArgumentParser:
     Exposed as a function (not module-level) so tests can construct + inspect
     without triggering jax.devices() side effects.
     """
-    parser = argparse.ArgumentParser(
-        description="Base model evaluation "
-    )
-    # PT mirror: --eval 
-    parser.add_argument(
-        "--eval",
-        type=str,
-        default="bpb,sample",
-        help=(
-            "Comma-separated evaluations: bpb,sample,core (default: bpb,sample). "
-            "core uses nanochat_jax.core_eval  — slow on "
-            "Mac CPU; --max-per-task=5 for sanity, =100 for TPU strict tier."
-        ),
-    )
-    # PT mirror: --hf-path
-    parser.add_argument(
-        "--hf-path",
-        type=str,
-        default=None,
-        help=(
-            "HuggingFace model path. NOT IMPLEMENTED in JAX-port — "
-            "use PT base_eval directly for HF model evaluation."
-        ),
-    )
-    # PT mirror: --source
-    parser.add_argument(
-        "--source",
-        type=str,
-        default="base",
-        choices=["base", "sft", "rl"],
-        help=(
-            "Source of the model: base|sft|rl. Default 'base'. "
-            "RL loading is reserved for a future port."
-        ),
-    )
-    # PT mirror: --model-tag, --step
-    parser.add_argument(
-        "--model-tag",
-        type=str,
-        default=None,
-        help="Model tag (default: auto-detect largest depth in checkpoints dir)",
-    )
-    parser.add_argument(
-        "--step",
-        type=int,
-        default=None,
-        help="Step to load (default: largest step in model_tag dir)",
-    )
-    # PT mirror: --max-per-task (CORE-only)
-    parser.add_argument(
-        "--max-per-task",
-        type=int,
-        default=100,
-        help=(
-            "(CORE-only) Max examples per CORE task. Default 100. "
-            "-1 = all examples; full CORE is slow and should run on TPU."
-        ),
-    )
-    # PT mirror: --device-batch-size
-    parser.add_argument(
-        "--device-batch-size",
-        type=int,
-        default=4,
-        help=(
-            "Per-device batch size for BPB evaluation. Default 4 "
-            "(Mac CPU sanity; PT default 32 for 8-GPU setup)"
-        ),
-    )
-    # JAX-port: --eval-steps
-    parser.add_argument(
-        "--eval-steps",
-        type=int,
-        default=4,
-        help=(
-            "Number of eval batches per BPB split. Total tokens evaluated per "
-            "process = eval_steps × device_batch_size × sequence_len."
-        ),
-    )
-    # PT mirror: --device-type 
-    parser.add_argument(
-        "--device-type",
-        type=str,
-        default="",
-        help="(unused; jax.devices() autodetects)",
-    )
-    # PT mirror: --seed (sample multinomial RNG)
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="JAX PRNGKey seed for sample multinomial (uncond) reproducibility",
-    )
-    # JAX-port: dtype opt-in 
-    parser.add_argument(
-        "--bf16",
-        action="store_true",
-        default=False,
-        help=(
-            "Use bf16 compute_dtype. Default fp32 for Mac "
-            "CPU sanity, opt-in for TPU."
-        ),
-    )
-    # JAX-port: sample uncond config 
-    parser.add_argument(
-        "--num-uncond-samples",
-        type=int,
-        default=2,
-        help=(
-            "Number of unconditioned samples ("
-            "PT default 8 → JAX 2 for ~5x speed)"
-        ),
-    )
-    parser.add_argument(
-        "--max-tokens-uncond",
-        type=int,
-        default=64,
-        help=(
-            "Max tokens per unconditioned sample ("
-            "PT default 128 → JAX 64 for ~2x speed)"
-        ),
-    )
-    parser.add_argument(
-        "--max-tokens-cond",
-        type=int,
-        default=16,
-        help="Max tokens per conditioned sample ",
-    )
-    parser.add_argument(
-        "--temperature-uncond",
-        type=float,
-        default=1.0,
-        help="Temperature for unconditioned samples ",
-    )
-    # JAX-port: distributed setup 
-    parser.add_argument(
-        "--no-distributed",
-        action="store_true",
-        default=False,
-        help="Skip jax.distributed.initialize() (Mac CPU / dev mode default-on)",
-    )
-    # PT mirror: output (JSON primary + CSV optional)
-    parser.add_argument(
-        "--out",
-        type=str,
-        default=None,
-        help=(
-            "Output JSON path (default: get_base_dir()/base_eval/"
-            "{model_slug}.json). Use - to skip writing."
-        ),
-    )
-    parser.add_argument(
-        "--partial-out",
-        type=str,
-        default=None,
-        help=(
-            "(CORE-only) Path to per-task partial JSON for preempt safety + "
-            "resume. Each task result persisted immediately after completion. "
-            "On rerun, completed tasks are skipped (resume from partial_out). "
-            "Recommended for TPU spot runs (preemption recovery)."
-        ),
-    )
-    # TPU default fp32 matmul can use bf16 internal accumulation; highest
-    # requests a slower, higher-accuracy accumulation path when needed.
-    parser.add_argument(
-        "--matmul-precision",
-        type=str,
-        default=None,
+    parser = argparse.ArgumentParser(description="Base model evaluation.")
+    parser.add_argument("--eval", type=str, default="bpb,sample",
+        help="Comma-separated modes: bpb,sample,core (default bpb,sample). core (DCLM CORE) is slow; cap with --max-per-task.")
+    parser.add_argument("--hf-path", type=str, default=None,
+        help="HuggingFace model path (NOT implemented in the JAX port; use PT base_eval for HF models).")
+    parser.add_argument("--source", type=str, default="base", choices=["base", "sft", "rl"],
+        help="Which checkpoint to load: base|sft|rl (rl reserved for a future port).")
+    parser.add_argument("--model-tag", type=str, default=None,
+        help="Model tag (default: the largest-depth tag in the checkpoints dir).")
+    parser.add_argument("--step", type=int, default=None,
+        help="Checkpoint step to load (default: the largest step for --model-tag).")
+    parser.add_argument("--max-per-task", type=int, default=100,
+        help="(CORE) Max examples per task. Default 100; -1 = all (full CORE, TPU-only).")
+    parser.add_argument("--device-batch-size", type=int, default=4,
+        help="Per-device batch size for BPB eval.")
+    parser.add_argument("--eval-steps", type=int, default=4,
+        help="BPB eval batches per split (tokens = eval_steps * device_batch_size * seq_len).")
+    parser.add_argument("--seed", type=int, default=42,
+        help="PRNG seed for the unconditioned (multinomial) samples.")
+    parser.add_argument("--bf16", action="store_true", default=False,
+        help="Use bf16 compute (default fp32; opt-in for TPU).")
+    parser.add_argument("--num-uncond-samples", type=int, default=2,
+        help="Number of unconditioned samples.")
+    parser.add_argument("--max-tokens-uncond", type=int, default=64,
+        help="Max tokens per unconditioned sample.")
+    parser.add_argument("--max-tokens-cond", type=int, default=16,
+        help="Max tokens per conditioned sample.")
+    parser.add_argument("--temperature-uncond", type=float, default=1.0,
+        help="Temperature for the unconditioned samples.")
+    parser.add_argument("--no-distributed", action="store_true", default=False,
+        help="Skip jax.distributed.initialize() (single-process / Mac CPU).")
+    parser.add_argument("--out", type=str, default=None,
+        help="Output JSON path (default: <base_dir>/base_eval/<slug>.json; '-' to skip).")
+    parser.add_argument("--partial-out", type=str, default=None,
+        help="(CORE) Per-task partial JSON for preempt-safe resume; recommended for TPU spot.")
+    # TPU fp32 matmul defaults to bf16 internal accumulation; "highest" forces a
+    # slower near-fp32 accumulation path.
+    parser.add_argument("--matmul-precision", type=str, default=None,
         choices=[None, "default", "high", "highest"],
-        help=(
-            "Override JAX default matmul precision (jax.config update). "
-            "TPU default = bf16 internal acc (Fastest). 'highest' = 6-pass bf16 "
-            "= near-fp32 acc (~2.5x slower)."
-        ),
-    )
-    parser.add_argument(
-        "--base-dir",
-        type=str,
-        default=None,
-        help=(
-            "Override checkpoints base dir (default: nanochat-jax cache directory)"
-        ),
-    )
+        help="Override JAX matmul precision; 'highest' = near-fp32 accumulation (slower).")
+    parser.add_argument("--base-dir", type=str, default=None,
+        help="Override the checkpoints base dir (default: the nanochat-jax cache).")
     return parser
 
 
@@ -312,13 +172,6 @@ def _format_devices() -> str:
     return ", ".join(f"{k}:{n}" for k, n in kinds.items())
 
 
-def _resolve_compute_dtype(bf16_flag: bool):
-    """Resolve compute_dtype from --bf16 flag (Q-3 (C)).
-
-    bf16 not supported on Mac arm64 CPU (numerical issues on some platforms). Default fp32 for safety.
-    """
-    return _DTYPE_BF16 if bf16_flag else _DTYPE_FP32
-
 
 # -----------------------------------------------------------------------------
 # CORE evaluation
@@ -326,9 +179,9 @@ def _resolve_compute_dtype(bf16_flag: bool):
 
 
 def _place_eval_bundle(file_path: str) -> None:
-    """Unzip ``eval_bundle.zip`` and place ``eval_bundle/`` in base dir.
+    """Unzip ``eval_bundle.zip`` and place ``eval_bundle/`` in the base dir.
 
-PT mirror: ``nanochat/scripts/base_eval.py:95-104`` (substitution 0).
+    Mirrors upstream ``nanochat/scripts/base_eval.py``.
 
     Used as ``postprocess_fn`` for :func:`download_file_with_lock` — extracts
     the zip into a temp dir, then atomically moves the inner ``eval_bundle/``
@@ -351,16 +204,14 @@ def _evaluate_core(
     *,
     partial_out: str | None = None,
 ) -> dict:
-    """Evaluate base model on the CORE benchmark (22 ICL tasks).
+    """Evaluate the base model on the CORE benchmark (22 ICL tasks).
 
-PT mirror: ``nanochat/scripts/base_eval.py:107-173`` (substitution 0
-    — yaml/csv/random framework-agnostic + nanochat_jax.core_eval.evaluate_task).
+    Mirrors upstream ``nanochat/scripts/base_eval.py`` (using
+    ``nanochat_jax.core_eval.evaluate_task``).
 
-    POST-FIX (2026-05-03 — TPU spot preemption recovery cascade):
-    ``partial_out`` parameter adds **resumable** partial JSON dump per task.
-    On preemption / restart, completed tasks are skipped (read from
-    ``partial_out`` JSON file). Each task result is persisted IMMEDIATELY
-    after completion → max loss = 1 task worth of compute on preemption.
+    ``partial_out`` adds a resumable per-task JSON dump: on restart, completed
+    tasks are skipped, and each task result is persisted immediately after it
+    finishes, so a preemption loses at most one task of compute.
 
     Parameters
     ----------
@@ -400,7 +251,7 @@ PT mirror: ``nanochat/scripts/base_eval.py:107-173`` (substitution 0
             random_baseline = row["Random baseline"]
             random_baselines[task_name] = float(random_baseline)
 
-    # Resume from partial_out if exists (POST-FIX — preempt safety net)
+    # Resume from partial_out if it exists (preempt safety net)
     results: dict[str, float] = {}
     centered_results: dict[str, float] = {}
     if partial_out and os.path.exists(partial_out):
@@ -477,7 +328,7 @@ PT mirror: ``nanochat/scripts/base_eval.py:107-173`` (substitution 0
             f"time: {elapsed:.2f}s"
         )
 
-        # Persist partial results IMMEDIATELY after task completes (POST-FIX preempt safety)
+        # Persist each task's result immediately (preempt safety)
         if partial_out:
             os.makedirs(os.path.dirname(partial_out) or ".", exist_ok=True)
             tmp_path = partial_out + ".tmp"
@@ -498,12 +349,9 @@ PT mirror: ``nanochat/scripts/base_eval.py:107-173`` (substitution 0
 
 
 def _run_core_mode(model, tokenizer, args: argparse.Namespace) -> dict | None:
-    """Run CORE mode and write CSV output (PT base_eval.py:278-298 mirror).
-
-Returns the ``core_results`` dict (or None if not master).
-
-    POST-FIX (2026-05-03): Forwards ``--partial-out`` to ``_evaluate_core``
-    for preempt-safe resume capability.
+    """Run CORE mode and write the CSV output; returns the ``core_results``
+    dict (or None if not master). Forwards ``--partial-out`` to
+    ``_evaluate_core`` for preempt-safe resume.
     """
     if not _is_master():
         # Non-master ranks still call evaluate_core (rank-stride loop), but
@@ -517,6 +365,12 @@ Returns the ``core_results`` dict (or None if not master).
     _print0("\n" + "=" * 80)
     _print0("CORE Evaluation")
     _print0("=" * 80)
+    if args.max_per_task > 0:
+        _print0(
+            f"[warn] sampled CORE (max_per_task={args.max_per_task}): NOT "
+            "comparable to leaderboard scores, which use --max-per-task -1 "
+            "(all examples). Expect a systematic offset."
+        )
     core_results = _evaluate_core(
         model, tokenizer,
         max_per_task=args.max_per_task,
@@ -529,7 +383,7 @@ Returns the ``core_results`` dict (or None if not master).
 def _write_core_csv(out_path: str, core_results: dict) -> None:
     """Write CORE results to CSV (PT base_eval.py:286-297 mirror).
 
-Format: ``Task,Accuracy,Centered`` rows + final ``CORE,,score`` row.
+    Format: ``Task,Accuracy,Centered`` rows + final ``CORE,,score`` row.
     """
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8", newline="") as f:
@@ -698,7 +552,7 @@ def _run_bpb_mode(
         f"total_tokens_per_split={total_tokens_per_split:,}"
     )
 
-    # token_bytes → JAX array inside)
+    # get_token_bytes() returns numpy; convert to a JAX array once here.
     token_bytes_np = get_token_bytes()
     token_bytes = jnp.asarray(token_bytes_np)
     assert token_bytes.shape[0] == tokenizer.get_vocab_size(), (
@@ -759,9 +613,9 @@ def _write_results_json(
     elapsed: float,
     core_results: dict | None = None,
 ) -> None:
-    """Write results to JSON (JSON primary over PT CSV).
+    """Write results to JSON (the primary artifact; upstream writes CSV).
 
-``core_results`` keyword added (None → no CORE block in JSON).
+    ``core_results=None`` omits the CORE block from the JSON.
     """
     payload = {
         "model_name": model_name,
@@ -850,7 +704,7 @@ def main(argv: list[str] | None = None) -> int:
         jax.config.update("jax_default_matmul_precision", args.matmul_precision)
         _print0(f"[info] jax_default_matmul_precision = {args.matmul_precision}")
 
-    # 3. Distributed setup 
+    # 3. Distributed setup
     if not args.no_distributed:
         try:
             jax.distributed.initialize()
@@ -871,7 +725,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # 4. Load model + tokenizer + meta
-    compute_dtype = _resolve_compute_dtype(args.bf16)
+    compute_dtype = _DTYPE_BF16 if args.bf16 else _DTYPE_FP32
     _print0(
         f"[info] Loading {args.source} model "
         f"(compute_dtype={compute_dtype}, model_tag={args.model_tag}, "
@@ -979,7 +833,6 @@ def main(argv: list[str] | None = None) -> int:
             })
         log_report_safe(section="Base model evaluation", data=report_data)
 
-    # 9. Cleanup
     return 0
 
 

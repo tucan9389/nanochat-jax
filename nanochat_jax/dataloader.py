@@ -70,10 +70,6 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
         epoch += 1
 
 
-def _shortest_doc_key(doc_buffer):
-    return lambda i: len(doc_buffer[i])
-
-
 def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
@@ -140,7 +136,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
                     pos += doc_len
                 else:
                     # No doc fits: crop the shortest in buffer to minimize waste.
-                    shortest_idx = min(range(len(doc_buffer)), key=_shortest_doc_key(doc_buffer))
+                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
                     doc = doc_buffer.pop(shortest_idx)
                     row_buffer[row_idx, pos:pos + remaining] = np.asarray(doc[:remaining], dtype=np.int64)
                     pos += remaining

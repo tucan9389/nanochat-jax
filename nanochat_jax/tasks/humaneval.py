@@ -2,7 +2,8 @@
 Evaluate the Chat model on HumanEval dataset.
 Despite the name this dataset is a coding benchmark.
 
-PT 1:1 mirror — substitution 0. Depends on `nanochat_jax.execution.execute_code` (Phase 2 cascade).
+1:1 port of upstream ``tasks/humaneval.py``, unchanged from PyTorch nanochat.
+Depends on ``nanochat_jax.execution.execute_code`` for sandboxed code execution.
 """
 
 import re

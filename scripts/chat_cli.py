@@ -104,7 +104,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _format_devices() -> str:
-    """Compact device list for diagnostics (e.g., 'cpu:1' or 'TpuDevice:8')."""
+    """Compact device list for diagnostics (e.g., 'cpu:1' or 'tpu:8')."""
     devices = jax.devices()
     if not devices:
         return "<no devices>"

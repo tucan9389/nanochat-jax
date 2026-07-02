@@ -19,6 +19,7 @@ from collections.abc import Iterable
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import multihost_utils
 
 from nanochat_jax.gpt import GPT, cross_entropy_with_ignore
 
@@ -113,8 +114,8 @@ def evaluate_bpb(
     if jax.process_count() > 1:
         nats_local = jnp.array(total_nats_host, dtype=jnp.float32)
         bytes_local = jnp.array(total_bytes_host, dtype=jnp.int64)
-        nats_all = jax.experimental.multihost_utils.process_allgather(nats_local)
-        bytes_all = jax.experimental.multihost_utils.process_allgather(bytes_local)
+        nats_all = multihost_utils.process_allgather(nats_local)
+        bytes_all = multihost_utils.process_allgather(bytes_local)
         total_nats_host = float(jnp.sum(nats_all))
         total_bytes_host = int(jnp.sum(bytes_all))
 

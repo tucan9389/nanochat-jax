@@ -1,0 +1,12 @@
+# Reproduction guards — intentional divergences from upstream nanochat
+
+This port intentionally differs from upstream nanochat (`karpathy/nanochat` @ `dc54a1a`) in **four places**. All four were found after the published models were trained, and "fixing" any of them changes what those runs produced — the decode fix changes chat generation, the truncation fix changes the CORE score on long prompts, the init fix changes the base-training trajectory itself, and the template fix changes the SFT data stream. Since the leaderboard promises that the public commit reproduces the published run (`dev/LEADERBOARD.md`, "Reproduction reference"), the divergences are **kept on purpose**. Each site carries a `NOTE: intentional divergence` comment pointing back here, and each is additionally pinned by regression tests in the maintainer's local verification net.
+
+| # | where (ours) | upstream behavior | divergence |
+|--|--|--|--|
+| 1 | `nanochat_jax/gpt.py` — `CausalSelfAttention.__call__`, the manual decode window mask (`window_mask = k_idx >= q_global - left_window + 1`) | `nanochat/flash_attention.py` decode path attends to *(window + 1) keys total* | an incremental-decode step attends to `w` keys where prefill/training attend to `w+1` (off-by-one) |
+| 2 | `nanochat_jax/core_eval.py` — the truncation block in `evaluate_task` (`max_seq_len = getattr(model.config, "sequence_len", ...)`) | `nanochat/core_eval.py` truncates only if `hasattr(model, 'max_seq_len')`; its native GPT has no such attribute, so it never truncates | our CORE eval always crops prompts longer than `sequence_len`; upstream never crops its native model |
+| 3 | `nanochat_jax/gpt.py` — `smear_gate` is created with the default (signed lecun) init and `init_weights` never re-initializes it | `nanochat/gpt.py` init: `uniform_(self.smear_gate.weight, 0.0, 0.02)` | our smear_gate starts signed; upstream's starts positive in `[0, 0.02]` (measured d2/3-step loss shift: `10.398951 -> 10.398958`) |
+| 4 | `nanochat_jax/tasks/spellingbee.py` — `USER_MSG_TEMPLATES` has no Korean block | upstream `tasks/spellingbee.py` includes 4 Korean templates between the Chinese and French blocks | the published SFT checkpoint was trained without them; re-adding them changes the SFT data augmentation stream (and therefore the post-SFT ChatEval numbers) |
+
+**If you ever decide to fix one** (a product decision — it trades reproduction of the published run for upstream fidelity): apply the fix, re-train / re-evaluate, and update `dev/LEADERBOARD.md` with the new numbers.

@@ -272,11 +272,11 @@ def sample_next_token(
 class RowState:
     """Per-row generation state. Tool-use is a Python-only state machine."""
 
-    current_tokens: list[int] = field(default_factory=list)
-    forced_tokens: deque = field(default_factory=deque)
-    in_python_block: bool = False
-    python_expr_tokens: list[int] = field(default_factory=list)
-    completed: bool = False
+    current_tokens: list[int] = field(default_factory=list)  # tokens generated so far
+    forced_tokens: deque = field(default_factory=deque)  # queued tokens to force-inject (tool output)
+    in_python_block: bool = False  # currently inside a tool-call block
+    python_expr_tokens: list[int] = field(default_factory=list)  # tokens of the current tool expression
+    completed: bool = False  # this row has finished generating
 
 
 class Engine:
