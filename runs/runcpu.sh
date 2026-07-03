@@ -14,7 +14,6 @@ set -euo pipefail
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}"
-WANDB_RUN="${WANDB_RUN:-dummy}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || PYTHON_BIN="python3"
 
@@ -96,7 +95,6 @@ echo "[runcpu] tiny d2 CPU wiring check | base tag: $MODEL_TAG | results: $RESUL
     --chatcore-max-sample 24 \
     --load-optimizer 1 \
     --log-every 10 \
-    --run "$WANDB_RUN" \
     --no-distributed
 
 # -----------------------------------------------------------------------------

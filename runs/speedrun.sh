@@ -9,13 +9,12 @@
 # For a tiny CPU wiring check (not quality evidence), use runs/runcpu.sh instead.
 #
 # The recipe is hardcoded below (like upstream nanochat's speedrun.sh). A few
-# operational knobs are env-overridable: MODEL_TAG, WANDB_RUN, NANOCHAT_JAX_BASE_DIR,
+# operational knobs are env-overridable: MODEL_TAG, NANOCHAT_JAX_BASE_DIR,
 # DEVICE_BATCH_SIZE (lower it if you OOM), NUM_ITERATIONS.
 
 set -euo pipefail
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
-WANDB_RUN="${WANDB_RUN:-dummy}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || PYTHON_BIN="python3"
 
@@ -111,7 +110,6 @@ wait "$DATASET_DOWNLOAD_PID"
     --chatcore-max-sample 24 \
     --load-optimizer 1 \
     --log-every 10 \
-    --run "$WANDB_RUN" \
     --bf16
 
 # -----------------------------------------------------------------------------
