@@ -13,7 +13,7 @@ Usage::
     python -m scripts.base_eval --source base --model-tag d12_jax_seed42 \\
         --eval bpb,sample --eval-steps 2 --device-batch-size 2
 
-    # TPU bf16 strict tier
+    # TPU bf16
     python -m scripts.base_eval --source base --model-tag d12_jax_seed42 \\
         --eval bpb,sample --eval-steps 20 --device-batch-size 4 --bf16
 

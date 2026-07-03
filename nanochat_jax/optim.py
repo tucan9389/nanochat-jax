@@ -39,6 +39,8 @@ from dataclasses import dataclass, field
 import jax
 import jax.numpy as jnp
 
+from nanochat_jax.recipes import RECIPES
+
 
 # Polar Express quintic coefficients tuned for ``num_iters=5``,
 # ``safety_factor=2e-2``, ``cushion=2`` (Amsel et al. 2025,
@@ -116,6 +118,7 @@ def setup_optimizer_param_groups(
     weight_decay: float = 0.0,
     scalar_lr: float = 0.5,
     polar_express_dtype: jax.numpy.dtype | None = None,
+    recipe: str = "dc54a1a",
 ) -> list[dict]:
     """Build the optimizer param groups.
 
@@ -125,7 +128,16 @@ def setup_optimizer_param_groups(
     value_embeds; the Muon LR receives a per-group
     ``max(1, pt_shape[-2] / pt_shape[-1]) ** 0.5`` factor inside
     :func:`step_optim`.
+
+    ``recipe`` names an entry in :data:`nanochat_jax.recipes.RECIPES` and
+    supplies the optimizer-internal constants that upstream nanochat changed
+    between leaderboard runs: the per-group AdamW betas/weight-decay, the
+    value-embeds LR scale, NorMuon beta2, and the Polar Express pre-norm.
     """
+    if recipe not in RECIPES:
+        raise ValueError(f"Unknown optimizer recipe: {recipe!r}")
+    r = RECIPES[recipe]
+
     dmodel_lr_scale = (n_embd / 768) ** -0.5
 
     # Matrix keys MUST follow PyTorch module-definition order so that the
@@ -153,20 +165,22 @@ def setup_optimizer_param_groups(
 
     groups: list[dict] = [
         dict(kind="adamw", param_keys=lm_head_keys,
-             lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96),
-             eps=1e-10, weight_decay=0.01),
+             lr=unembedding_lr * dmodel_lr_scale, betas=r.lm_head_betas,
+             eps=1e-10, weight_decay=r.lm_head_wd),
         dict(kind="adamw", param_keys=embedding_keys,
-             lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995),
-             eps=1e-10, weight_decay=0.001),
+             lr=embedding_lr * dmodel_lr_scale, betas=r.embedding_betas,
+             eps=1e-10, weight_decay=r.embedding_wd),
         dict(kind="adamw", param_keys=value_embeds_keys,
-             lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995),
-             eps=1e-10, weight_decay=0.01),
+             lr=embedding_lr * dmodel_lr_scale * r.ve_lr_scale, betas=r.ve_betas,
+             eps=1e-10, weight_decay=r.ve_wd),
         dict(kind="adamw", param_keys=resid_keys,
              lr=scalar_lr * 0.01, betas=(0.8, 0.95),
-             eps=1e-10, weight_decay=0.05),
+             eps=1e-10, weight_decay=r.resid_wd),
         dict(kind="adamw", param_keys=x0_keys,
              lr=scalar_lr, betas=(0.96, 0.95),  # higher beta1 for x0
              eps=1e-10, weight_decay=0.0),
+        # The smear/backout params exist in every recipe (inert when the
+        # recipe disables the modules: zero grads, zero weight decay).
         dict(kind="adamw", param_keys=smear_keys,
              lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
     ]
@@ -179,7 +193,8 @@ def setup_optimizer_param_groups(
         ]
         groups.append(dict(
             kind="muon", param_keys=group_keys, lr=matrix_lr,
-            momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+            momentum=0.95, ns_steps=5, beta2=r.muon_beta2, weight_decay=weight_decay,
+            pe_prenorm=r.pe_prenorm,
             polar_express_dtype=polar_express_dtype,
         ))
 
@@ -268,7 +283,9 @@ def adamw_step(
     )
 
 
-def polar_express_iters(g_pt: jax.Array, ns_steps: int = 5) -> jax.Array:
+def polar_express_iters(
+    g_pt: jax.Array, ns_steps: int = 5, *, prenorm_scale: float = 1.01
+) -> jax.Array:
     """5-step Polar Express orthogonalization in PyTorch layout ``(..., out, in)``.
 
     Muon replaces each matrix gradient with the nearest (semi-)orthogonal matrix,
@@ -279,10 +296,11 @@ def polar_express_iters(g_pt: jax.Array, ns_steps: int = 5) -> jax.Array:
     Computes ``X = orthogonalize(g)`` via Newton-Schulz with the Polar Express
     quintic coefficients. The branches handle tall vs wide matrices (the
     quadratic form ``X.T @ X`` or ``X @ X.T`` is whichever is smaller).
-    Inputs are normalized by ``||g|| * 1.01 + 1e-6`` to keep eigenvalues
-    bounded for the iteration.
+    Inputs are normalized by ``||g|| * prenorm_scale + 1e-6`` to keep
+    eigenvalues bounded for the iteration (1.01 in the default recipe;
+    upstream Run 4 used 1.02).
     """
-    norm = jnp.linalg.norm(g_pt, axis=(-2, -1), keepdims=True) * 1.01 + 1e-6
+    norm = jnp.linalg.norm(g_pt, axis=(-2, -1), keepdims=True) * prenorm_scale + 1e-6
     X = g_pt / norm
 
     coeffs = POLAR_EXPRESS_COEFFS[:ns_steps]
@@ -333,6 +351,7 @@ def muon_step(
     lr: jax.Array, momentum: jax.Array, wd: jax.Array, beta2: jax.Array,
     ns_steps: int,
     *,
+    pe_prenorm: float = 1.01,
     polar_express_dtype: jax.numpy.dtype | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Fused Muon step.
@@ -342,7 +361,7 @@ def muon_step(
     2. Optional cast of the momentum-updated gradient to ``polar_express_dtype``
        before orthogonalization. Defaults to fp32; setting to bf16 mirrors
        upstream's Newton-Schulz input cast (``X = g.bfloat16()``) — the
-       published recipe keeps fp32 here.
+       shipped recipes keep fp32 here.
     3. Polar Express orthogonalization (5-step Newton-Schulz).
     4. NorMuon variance reduction.
     5. Cautious weight decay + parameter update:
@@ -364,7 +383,7 @@ def muon_step(
     if polar_express_dtype is not None and polar_express_dtype != jax.numpy.float32:
         g_step = g_step.astype(polar_express_dtype)
 
-    g_orth = polar_express_iters(g_step, ns_steps=ns_steps)
+    g_orth = polar_express_iters(g_step, ns_steps=ns_steps, prenorm_scale=pe_prenorm)
 
     red_dim = -1 if g_orth.shape[-2] >= g_orth.shape[-1] else -2
     g_scaled, second_momentum_buffer_new = norm_muon_scale(
@@ -429,6 +448,7 @@ def step_optim(
             wd = jnp.asarray(g["weight_decay"], dtype=jnp.float32)
             beta2 = jnp.asarray(g["beta2"], dtype=jnp.float32)
             ns_steps = int(g["ns_steps"])
+            pe_prenorm = float(g.get("pe_prenorm", 1.01))
             polar_express_dtype = g.get("polar_express_dtype", None)
 
             stacked_g = jnp.stack([grads[k] for k in keys], axis=0)
@@ -438,6 +458,7 @@ def step_optim(
                 stacked_g, stacked_p,
                 buf["momentum_buffer"], buf["second_momentum_buffer"],
                 lr, momentum, wd, beta2, ns_steps,
+                pe_prenorm=pe_prenorm,
                 polar_express_dtype=polar_express_dtype,
             )
             for i, k in enumerate(keys):

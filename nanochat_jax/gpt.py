@@ -2,7 +2,7 @@
 
 Notable features (mirroring upstream nanochat):
 - rotary positional embeddings, no learnable position embeddings
-- QK norm with q, k pre-scale of 1.2 (sharper attention)
+- QK norm with a configurable q, k pre-scale (1.2 in the default recipe)
 - untied token embedding and lm_head
 - ReLU squared activation in the MLP
 - per-layer learnable scalars (resid_lambdas, x0_lambdas, smear, backout)
@@ -77,6 +77,27 @@ class GPTConfig:
     splash_block_kv: int | None = None
     splash_block_kv_compute: int | None = None
     ve_grad_impl: Literal["scatter", "onehot"] = "scatter"
+    # Recipe knobs. The defaults are the ``dc54a1a`` recipe (the values
+    # the published d24 baseline trained with); ``scripts/base_train.py --recipe``
+    # applies other entries from ``nanochat_jax/recipes.py``. Forward-
+    # affecting knobs are recorded in checkpoint meta so evaluation rebuilds
+    # the same architecture.
+    softcap_cap: float = 15.0
+    rope_base: float = 100000.0
+    # None = the default rule (ceil(seq/4) rounded up to a 128-multiple);
+    # an explicit value is used as-is (Run 4 uses sequence_len // 2).
+    short_window: int | None = None
+    ve_gate_channels: int = 12
+    ve_gate_mult: float = 3.0
+    qk_prescale: float = 1.2
+    use_smear: bool = True
+    use_backout: bool = True
+    # init_weights knobs (affect fresh initialization only; a loaded
+    # checkpoint carries its weights regardless of these).
+    wte_init_std: float = 0.8
+    c_fc_init_scale: float = 0.4
+    lambda_init: Literal["ramp", "flat"] = "ramp"
+    ve_gate_init: Literal["uniform", "zeros"] = "uniform"
 
 
 def has_ve(layer_idx: int, n_layer: int) -> bool:
@@ -137,7 +158,11 @@ def _compute_window_sizes(cfg: "GPTConfig") -> list[tuple[int, int]]:
         f"Invalid window_pattern: {pattern!r}. Use only S and L."
     )
     long_window = cfg.sequence_len
-    short_window = -(-long_window // 4 // 128) * 128
+    short_window = (
+        cfg.short_window
+        if cfg.short_window is not None
+        else -(-long_window // 4 // 128) * 128
+    )
     char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
     window_sizes = [
         char_to_window[pattern[i % len(pattern)]] for i in range(cfg.n_layer)
@@ -203,7 +228,7 @@ class MLP(nnx.Module):
 
 
 class CausalSelfAttention(nnx.Module):
-    """Causal self-attention with QK norm, RoPE, and a 1.2 q/k pre-scale.
+    """Causal self-attention with QK norm, RoPE, and a configurable q/k pre-scale.
 
     GQA is supported through ``n_kv_head <= n_head AND n_head % n_kv_head == 0``.
     ``jax.nn.dot_product_attention`` natively broadcasts ``k``/``v`` when their
@@ -224,7 +249,9 @@ class CausalSelfAttention(nnx.Module):
         self.n_rep = cfg.n_head // cfg.n_kv_head
         self.n_embd = cfg.n_embd
         self.head_dim = cfg.n_embd // cfg.n_head
-        self.ve_gate_channels = 12
+        self.ve_gate_channels = cfg.ve_gate_channels
+        self.ve_gate_mult = cfg.ve_gate_mult
+        self.qk_prescale = cfg.qk_prescale
         self.attn_impl: Literal["xla", "splash"] = cfg.attn_impl
         self.splash_block_q = cfg.splash_block_q
         self.splash_block_kv = cfg.splash_block_kv
@@ -260,20 +287,24 @@ class CausalSelfAttention(nnx.Module):
         if ve is not None:
             assert self.ve_gate is not None
             ve_view = ve.reshape(B, T, self.n_kv_head, self.head_dim)
-            gate = 3.0 * jax.nn.sigmoid(self.ve_gate(x[..., : self.ve_gate_channels]))
+            gate = self.ve_gate_mult * jax.nn.sigmoid(
+                self.ve_gate(x[..., : self.ve_gate_channels])
+            )
             v = v + gate[..., None] * ve_view
 
         cos, sin = cos_sin
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
-        # The 1.2 multipliers compose with dpa's default 1/sqrt(D) scale to
-        # an effective 1.44/sqrt(D) -- a sharper attention scale that the
-        # upstream nanochat introduced empirically.
+        # The published 1.2 pre-scale composes with dpa's default 1/sqrt(D)
+        # scale to an effective 1.44/sqrt(D) -- a sharper attention scale that
+        # the upstream nanochat introduced empirically (Run 4 has no pre-scale;
+        # its recipe sets qk_prescale=1.0, which skips the multiply entirely).
         q = rms_norm(q)
         k = rms_norm(k)
-        q = q * 1.2
-        k = k * 1.2
+        if self.qk_prescale != 1.0:
+            q = q * self.qk_prescale
+            k = k * self.qk_prescale
 
         if kv_cache is None:
             if self.attn_impl == "splash":
@@ -427,7 +458,9 @@ class GPT(nnx.Module):
 
         # Over-allocate the rotary cache by 10x (matches upstream nanochat).
         self.rotary_seq_len = cfg.sequence_len * 10
-        cos, sin = _precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        cos, sin = _precompute_rotary_embeddings(
+            self.rotary_seq_len, head_dim, base=cfg.rope_base
+        )
         self.cos = nnx.data(cos)
         self.sin = nnx.data(sin)
 
@@ -494,7 +527,7 @@ class GPT(nnx.Module):
 
         wte_shape = self.transformer.wte.embedding.value.shape
         self.transformer.wte.embedding = nnx.Param(
-            jnp.array(rng.normal(0.0, 0.8, wte_shape), dtype=jnp.float32)
+            jnp.array(rng.normal(0.0, cfg.wte_init_std, wte_shape), dtype=jnp.float32)
         )
 
         lm_shape = self.lm_head.kernel.value.shape
@@ -514,23 +547,28 @@ class GPT(nnx.Module):
                 jnp.zeros_like(block.attn.c_proj.kernel.value)
             )
             fc_shape = block.mlp.c_fc.kernel.value.shape
+            fc_s = s * cfg.c_fc_init_scale
             block.mlp.c_fc.kernel = nnx.Param(
-                jnp.array(rng.uniform(-s * 0.4, s * 0.4, fc_shape), dtype=jnp.float32)
+                jnp.array(rng.uniform(-fc_s, fc_s, fc_shape), dtype=jnp.float32)
             )
             block.mlp.c_proj.kernel = nnx.Param(
                 jnp.zeros_like(block.mlp.c_proj.kernel.value)
             )
 
-        resid = jnp.array(
-            [1.15 - (0.10 * i / max(n_layer - 1, 1)) for i in range(n_layer)],
-            dtype=jnp.float32,
-        )
+        if cfg.lambda_init == "flat":
+            # Run 4 (324e69c): resid=1.0 and x0=0.1, uniform across layers.
+            resid = jnp.ones((n_layer,), dtype=jnp.float32)
+            x0 = 0.1 * jnp.ones((n_layer,), dtype=jnp.float32)
+        else:
+            resid = jnp.array(
+                [1.15 - (0.10 * i / max(n_layer - 1, 1)) for i in range(n_layer)],
+                dtype=jnp.float32,
+            )
+            x0 = jnp.array(
+                [0.20 - (0.15 * i / max(n_layer - 1, 1)) for i in range(n_layer)],
+                dtype=jnp.float32,
+            )
         self.resid_lambdas = nnx.Param(resid)
-
-        x0 = jnp.array(
-            [0.20 - (0.15 * i / max(n_layer - 1, 1)) for i in range(n_layer)],
-            dtype=jnp.float32,
-        )
         self.x0_lambdas = nnx.Param(x0)
 
         for ve in self.value_embeds.values():
@@ -542,9 +580,14 @@ class GPT(nnx.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 gate_shape = block.attn.ve_gate.kernel.value.shape
-                block.attn.ve_gate.kernel = nnx.Param(
-                    jnp.array(rng.uniform(0.0, 0.02, gate_shape), dtype=jnp.float32)
-                )
+                if cfg.ve_gate_init == "zeros":
+                    # Run 4 (324e69c): gate = mult * sigmoid(0) starts neutral.
+                    gate_kernel = jnp.zeros(gate_shape, dtype=jnp.float32)
+                else:
+                    gate_kernel = jnp.array(
+                        rng.uniform(0.0, 0.02, gate_shape), dtype=jnp.float32
+                    )
+                block.attn.ve_gate.kernel = nnx.Param(gate_kernel)
 
         if cast_embeddings_to_compute_dtype and cfg.compute_dtype != jnp.float32:
             wte_val = self.transformer.wte.embedding.value.astype(cfg.compute_dtype)
@@ -617,10 +660,11 @@ class GPT(nnx.Module):
         x = rms_norm(x)
 
         if kv_cache is None:
-            gate = self.smear_lambda[...].astype(x.dtype) * jax.nn.sigmoid(
-                self.smear_gate(x[:, 1:, :24])
-            )
-            x = jnp.concatenate([x[:, :1], x[:, 1:] + gate * x[:, :-1]], axis=1)
+            if cfg.use_smear:  # smear is absent from the Run-4 recipe
+                gate = self.smear_lambda[...].astype(x.dtype) * jax.nn.sigmoid(
+                    self.smear_gate(x[:, 1:, :24])
+                )
+                x = jnp.concatenate([x[:, :1], x[:, 1:] + gate * x[:, :-1]], axis=1)
         else:
             x_pre_smear_present = bool(kv_cache.has_prev[...])
             x_pre_smear = (
@@ -629,19 +673,20 @@ class GPT(nnx.Module):
             kv_cache.prev_embedding[...] = x[:, -1:, :]
             kv_cache.has_prev[...] = jnp.array(True)
 
-            if T > 1:
-                gate = self.smear_lambda[...].astype(x.dtype) * jax.nn.sigmoid(
-                    self.smear_gate(x[:, 1:, :24])
-                )
-                x = jnp.concatenate(
-                    [x[:, :1], x[:, 1:] + gate * x[:, :-1]], axis=1
-                )
-            elif x_pre_smear is not None:
-                gate = self.smear_lambda[...].astype(x.dtype) * jax.nn.sigmoid(
-                    self.smear_gate(x[:, :, :24])
-                )
-                x = x + gate * x_pre_smear
-            # else: T=1 first step after empty cache (no prev) -- skip smear.
+            if cfg.use_smear:  # no smear on the Run-4 decode path either
+                if T > 1:
+                    gate = self.smear_lambda[...].astype(x.dtype) * jax.nn.sigmoid(
+                        self.smear_gate(x[:, 1:, :24])
+                    )
+                    x = jnp.concatenate(
+                        [x[:, :1], x[:, 1:] + gate * x[:, :-1]], axis=1
+                    )
+                elif x_pre_smear is not None:
+                    gate = self.smear_lambda[...].astype(x.dtype) * jax.nn.sigmoid(
+                        self.smear_gate(x[:, :, :24])
+                    )
+                    x = x + gate * x_pre_smear
+                # else: T=1 first step after empty cache (no prev) -- skip smear.
 
         x0 = x
 
@@ -665,14 +710,14 @@ class GPT(nnx.Module):
             if i == backout_layer:
                 x_backout = x
 
-        if x_backout is not None:
+        if x_backout is not None and cfg.use_backout:  # backout absent in Run 4
             x = x - self.backout_lambda[...].astype(x.dtype) * x_backout
 
         x = rms_norm(x)
         logits = self.lm_head(x)
         logits = logits[..., : cfg.vocab_size]
         logits = logits.astype(jnp.float32)
-        logits = softcap(logits, cap=15.0)
+        logits = softcap(logits, cap=cfg.softcap_cap)
 
         if targets is not None:
             return cross_entropy_with_ignore(
@@ -718,10 +763,11 @@ class GPT(nnx.Module):
         if granularity == "high":
             ints["x_after_norm0"] = x
 
-        gate = self.smear_lambda[...].astype(x.dtype) * jax.nn.sigmoid(
-            self.smear_gate(x[:, 1:, :24])
-        )
-        x = jnp.concatenate([x[:, :1], x[:, 1:] + gate * x[:, :-1]], axis=1)
+        if cfg.use_smear:  # smear is absent from the Run-4 recipe
+            gate = self.smear_lambda[...].astype(x.dtype) * jax.nn.sigmoid(
+                self.smear_gate(x[:, 1:, :24])
+            )
+            x = jnp.concatenate([x[:, :1], x[:, 1:] + gate * x[:, :-1]], axis=1)
         if granularity in ("high", "block"):
             ints["x_after_smear"] = x
 
@@ -750,7 +796,7 @@ class GPT(nnx.Module):
             if i == backout_layer:
                 x_backout = x
 
-        if x_backout is not None:
+        if x_backout is not None and cfg.use_backout:  # backout absent in Run 4
             x = x - self.backout_lambda[...].astype(x.dtype) * x_backout
         if granularity in ("high", "block"):
             ints["x_after_backout"] = x
@@ -764,7 +810,7 @@ class GPT(nnx.Module):
         logits = logits.astype(jnp.float32)
         if granularity == "high":
             ints["logits_pre_softcap"] = logits
-        logits = softcap(logits, cap=15.0)
+        logits = softcap(logits, cap=cfg.softcap_cap)
         ints["logits"] = logits
 
         if targets is not None:

@@ -50,6 +50,7 @@ from nanochat_jax.base_train_config import ( # noqa: E402
     resolve_num_iterations,
 )
 from nanochat_jax.common import get_base_dir, setup_distributed_env_vars # noqa: E402
+from nanochat_jax.recipes import DEFAULT_RECIPE, RECIPES # noqa: E402
 from nanochat_jax.gpt import GPT # noqa: E402
 from nanochat_jax.grad_utils import nnx_state_to_flat_dict # noqa: E402
 from nanochat_jax.loss_eval import evaluate_bpb # noqa: E402
@@ -75,34 +76,6 @@ def make_synthetic_batch(
     """
     tokens = rng.integers(0, vocab_size, size=(batch_size, seq_len + 1), dtype=np.int64)
     return tokens[:, :-1], tokens[:, 1:]
-
-
-def save_weights(model: GPT, path: str) -> None:
-    """Extract NNX :class:`Param` leaves and save as ``.npz`` for comparison.
-
-    Uses :func:`nnx_state_to_flat_dict` to produce a flat
-    string-keyed dict matching weight_converter format. The .npz can be
-    loaded by :func:`numpy.load` and compared element-wise across runs
-    (single-host vs multi-host) to compute the per-step weights diff.
-    """
-    params_state = nnx.state(model, nnx.Param)
-    flat_dict = nnx_state_to_flat_dict(params_state)
-    np_dict = {k: np.asarray(v) for k, v in flat_dict.items()}
-    # Keys are mangled ('.' -> '__') before savez and restored by
-    # ``restore_key`` on load. The mangling predates this file's readers and is
-    # kept so old and new .npz dumps stay key-compatible with each other.
-    np.savez(path, **{_safe_key(k): v for k, v in np_dict.items()})
-
-
-
-def _safe_key(k: str) -> str:
-    """numpy savez uses keyword args; replace '.' with '__' to round-trip."""
-    return k.replace(".", "__")
-
-
-def restore_key(safe_k: str) -> str:
-    """Inverse of :func:`_safe_key` — restore original dotted key."""
-    return safe_k.replace("__", ".")
 
 
 def _rolling_delete_old_checkpoints(
@@ -169,6 +142,15 @@ def main() -> int:
     g_ckpt = parser.add_argument_group("checkpointing / resume")
     g_run = parser.add_argument_group("run control / logging")
     g_dev = parser.add_argument_group("developer / debugging")
+    g_model.add_argument(
+        "--recipe", type=str, default=DEFAULT_RECIPE,
+        choices=sorted(RECIPES),
+        help="Training recipe: the architecture + optimizer-internal values "
+        "pinned by an upstream nanochat commit (see nanochat_jax/recipes.py "
+        "for every recipe and axis). LR/schedule "
+        "flags are never set by the recipe — they stay explicit, and a "
+        "recipe with a pinned LR envelope asserts them at startup.",
+    )
     g_model.add_argument("--depth", type=int, default=12, help="Model depth (n_layer)")
     g_model.add_argument(
         "--aspect-ratio", type=int, default=64,
@@ -250,26 +232,6 @@ def main() -> int:
     g_opt.add_argument(
         "--scalar-lr", type=float, default=0.5,
         help="Adam LR for scalar params. Karpathy default 0.5.",
-    )
-    g_dev.add_argument(
-        "--weights-out",
-        type=str,
-        default=None,
-        help="Optional final weights .npz path.",
-    )
-    g_dev.add_argument(
-        "--per-step-weights-out",
-        type=str,
-        default=None,
-        help="Optional dir for per-step weights .npz snapshots.",
-    )
-    g_dev.add_argument(
-        "--save-every",
-        type=int,
-        default=1,
-        help="Save per-step weights every N steps (default 1=every step). "
-        "Step 0 + final step always saved. Use 50 for {0, 50, 99} sample only "
-        "(suitable for d12 large model where per-step disk = ~60-100GB).",
     )
     g_run.add_argument(
         "--no-distributed",
@@ -505,6 +467,32 @@ def main() -> int:
         splash_block_kv_compute=args.splash_block_kv_compute,
         ve_grad_impl=args.ve_grad_impl,
     )
+    # Recipe config overrides MUST land before GPT() below: ve_gate_channels
+    # changes the parameter count that --target-param-data-ratio derives the
+    # horizon from.
+    recipe = RECIPES[args.recipe]
+    for field_name, value in recipe.config.items():
+        setattr(config, field_name, value)
+    if args.recipe == "324e69c":
+        config.short_window = args.seq_len // 2  # Run 4: S window = seq // 2
+    if is_master:
+        print(f"[info] recipe={args.recipe}")
+    # Envelope guard: a recipe with a pinned LR envelope declares an exact
+    # reproduction of that upstream run. The CLI defaults for LR/schedule are
+    # the default recipe's values; a forgotten launch flag would silently
+    # train a mixed recipe. Fail loudly before any compute.
+    if recipe.lr_envelope is not None:
+        expect = {k: (getattr(args, k), want) for k, want in recipe.lr_envelope.items()}
+        bad = {k: v for k, (v, want) in expect.items() if abs(v - want) > 1e-9}
+        if is_master:
+            print("[info] recipe LR envelope: " + " ".join(
+                f"{k}={v}" for k, (v, _w) in expect.items()))
+        if bad:
+            raise SystemExit(
+                f"[recipe guard] --recipe {args.recipe} set but the LR/schedule "
+                f"envelope deviates from that run: {bad}. Pass the run's values "
+                f"or drop the recipe flag."
+            )
     rngs = nnx.Rngs(args.seed)
     model = GPT(config, rngs=rngs)
     model.init_weights(
@@ -577,7 +565,9 @@ def main() -> int:
         unembedding_lr=args.unembedding_lr * _batch_lr_scale,
         scalar_lr=args.scalar_lr * _batch_lr_scale,
         polar_express_dtype=polar_express_dtype,
+        recipe=args.recipe,
     )
+    wd_schedule = recipe.wd_schedule
 
     # Compute num_iterations (total_batch_size already resolved above).
     num_iterations, horizon_source = resolve_num_iterations(
@@ -716,8 +706,6 @@ def main() -> int:
         return 0
     losses: list[float] = []
     t0 = time.time()
-    if args.per_step_weights_out is not None and is_master:
-        os.makedirs(args.per_step_weights_out, exist_ok=True)
 
     # MFU bookkeeping (Karpathy nanochat parity).
     num_flops_per_token = int(model.estimate_flops_per_token())
@@ -881,6 +869,17 @@ def main() -> int:
                 "splash_block_kv": config.splash_block_kv,
                 "splash_block_kv_compute": config.splash_block_kv_compute,
                 "ve_grad_impl": config.ve_grad_impl,
+                # Forward-affecting recipe knobs: evaluation/SFT rebuild the
+                # same architecture from meta alone (init-only knobs omitted —
+                # a loaded checkpoint carries its weights).
+                "softcap_cap": config.softcap_cap,
+                "rope_base": config.rope_base,
+                "short_window": config.short_window,
+                "ve_gate_channels": config.ve_gate_channels,
+                "ve_gate_mult": config.ve_gate_mult,
+                "qk_prescale": config.qk_prescale,
+                "use_smear": config.use_smear,
+                "use_backout": config.use_backout,
             },
             "depth": args.depth,
             "aspect_ratio": args.aspect_ratio,
@@ -958,7 +957,9 @@ def main() -> int:
             get_muon_momentum(step, num_iterations, args.warmdown_ratio)
         )
         wd = jnp.float32(
-            get_weight_decay(step, num_iterations, weight_decay_scaled)
+            get_weight_decay(
+                step, num_iterations, weight_decay_scaled, schedule=wd_schedule
+            )
         )
 
         if grad_accum_steps > 1 and args.grad_accum_impl == "fused":
@@ -1040,7 +1041,7 @@ def main() -> int:
                 model, optim_state, acc_grads, lrm, mom, wd
             )
 
-        # 7d. NaN guard
+        # 7c. NaN guard
         loss_val = float(loss)
         if not np.isfinite(loss_val):
             raise ValueError(
@@ -1052,22 +1053,7 @@ def main() -> int:
             )
         losses.append(loss_val)
 
-        # 7e. Per-step weights save (master only). Step 0 + final
-        # always saved; intermediate steps every --save-every steps.
-        if args.per_step_weights_out is not None and is_master:
-            _sync_fused_model_state()
-            save_this_step = (
-                step == 0
-                or step == num_iterations - 1
-                or (args.save_every > 0 and step % args.save_every == 0)
-            )
-            if save_this_step:
-                step_path = os.path.join(
-                    args.per_step_weights_out, f"step_{step:04d}.npz"
-                )
-                save_weights(model, step_path)
-
-        # 7f. Logging (master only)
+        # 7d. Logging (master only)
         step_dt = time.time() - step_start_time
         if is_master and (step % args.log_every == 0 or step == num_iterations - 1):
             elapsed = time.time() - t0
@@ -1089,7 +1075,7 @@ def main() -> int:
                 flush=True,
             )
 
-        # 7g. : checkpoint save BEFORE eval — ckpt safe even if eval crashes.
+        # 7e. Checkpoint save BEFORE eval — ckpt safe even if eval crashes.
         # Save at: last_step OR (step > 0 AND step != resume_from_step AND
         # checkpoint_every > 0 AND step % checkpoint_every == 0). PT 1:1 mirror.
         is_last_step = step == num_iterations - 1
@@ -1109,7 +1095,7 @@ def main() -> int:
             # training_log.jsonl after eval completes; meta.json val_bpb = null.
             _save_intermediate_checkpoint(step, val_bpb=None)
 
-        # 7h. : periodic val_bpb measurement AFTER checkpoint save.
+        # 7f. Periodic val_bpb measurement AFTER checkpoint save.
         # Initial eval at step 0 triggers a large JIT compile because the eval
         # graph is structurally different from the train graph. Skip eval at
         # step 0; the first eval lands at step == eval_every.
@@ -1152,11 +1138,6 @@ def main() -> int:
 
     _sync_fused_model_state()
 
-    # 8. Final weights save
-    if args.weights_out is not None and is_master:
-        save_weights(model, args.weights_out)
-        print(f"[info] Saved final weights to {args.weights_out}")
-
     if is_master and losses:
         elapsed = time.time() - t0
         executed_steps = len(losses)
@@ -1168,7 +1149,7 @@ def main() -> int:
         print(f"[done] losses[-5:] = {losses[-5:]}")
         print(f"[done] final loss = {losses[-1]:.6f}")
 
-    # 9. val BPB measurement. Runs on master + all hosts;
+    # 8. val BPB measurement. Runs on master + all hosts;
     # ``evaluate_bpb`` does the cross-host all-reduce internally
     # (loss_eval.py:196+). PT mirror: base_train.py:421-435 final eval.
     final_bpb_report = None

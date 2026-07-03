@@ -55,10 +55,11 @@ wait "$DATASET_DOWNLOAD_PID"
 
 # d24 recipe. Hyperparameters not shown (LRs, schedule, weight decay, aspect/head-dim)
 # are base_train's defaults. Most flags below differ from the defaults or are
-# TPU-specific; a few that match today's defaults (--seq-len, --vocab-size, --bf16,
-# --keep-last-checkpoints) are kept explicit on purpose: they define the published
-# recipe, so a future default drift cannot silently change this run.
+# TPU-specific; a few that match today's defaults (--recipe, --seq-len, --vocab-size,
+# --bf16, --keep-last-checkpoints) are kept explicit on purpose: they pin this
+# run's recipe, so a future default change cannot silently alter it.
 "$PYTHON_BIN" -m scripts.base_train \
+    --recipe=dc54a1a \
     --depth=24 \
     --seq-len=2048 \
     --vocab-size=32768 \

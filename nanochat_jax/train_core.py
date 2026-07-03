@@ -120,8 +120,18 @@ def get_weight_decay(
     it: int,
     num_iterations: int,
     weight_decay_init: float,
+    schedule: str = "cosine",
 ) -> float:
-    """Cosine decay to zero (1:1 mirror of ``base_train.py:385-386``)."""
+    """Weight-decay envelope, decaying to zero over the horizon.
+
+    ``"cosine"`` is the published recipe (1:1 mirror of upstream
+    ``base_train.py:385-386``); ``"linear"`` is upstream Run 4 (324e69c):
+    ``wd0 * (1 - it/num_iterations)``.
+    """
+    if schedule == "linear":
+        return weight_decay_init * (1.0 - it / num_iterations)
+    if schedule != "cosine":
+        raise ValueError(f"Unknown weight-decay schedule: {schedule!r}")
     return weight_decay_init * 0.5 * (1.0 + math.cos(math.pi * it / num_iterations))
 
 
@@ -210,6 +220,7 @@ def init_train_state(
     weight_decay: float = 0.0,
     scalar_lr: float = 0.5,
     polar_express_dtype: jnp.dtype | None = None,
+    recipe: str = "dc54a1a",
 ) -> tuple[list[dict], MuonAdamWState]:
     """Build ``(param_groups, optim_state)`` for a freshly-built :class:`GPT`.
 
@@ -240,6 +251,7 @@ def init_train_state(
         weight_decay=weight_decay,
         scalar_lr=scalar_lr,
         polar_express_dtype=polar_express_dtype,
+        recipe=recipe,
     )
     # Record initial_lr for schedule scaling (PT torch.optim standard mirror)
     for g in param_groups:
@@ -253,7 +265,7 @@ def init_train_state(
 # -----------------------------------------------------------------------------
 #
 # A separate :func:`make_train_step_sharded` factory exists alongside the
-# basic :func:`train_step` so that adding multi-host sharding does not change
+# basic single-device step so that adding multi-host sharding does not change
 # the single-device numeric baseline. The factory closure-captures ``mesh``
 # and ``param_groups`` (so they are not JIT inputs and the non-array leaves
 # like ``"kind": "adamw"`` are not traced) and returns an ``nnx.jit``-compiled
@@ -303,7 +315,7 @@ def make_train_step_sharded(
         (model, optim_state, idx, targets, lr_mult, muon_momentum, muon_wd)
             -> (loss, new_optim_state)
 
-    matching the existing :func:`train_step` minus the ``mesh``,
+    matching the single-device step signature minus the ``mesh``,
     ``param_groups``, and ``optim_state`` arguments — those are captured via
     closure so that non-array metadata (``kind: str``, ``param_keys:
     list[str]``, ``MuonAdamWState`` structure) does not enter the jit tracer.
@@ -331,8 +343,8 @@ def make_train_step_sharded(
     Single-device: on a 1-device CPU mesh
     XLA simplifies all sharding constraints to replicated, so the returned
     callable matches an unsharded step for ``loss`` (bit-exact) and within
-    ULP for ``weights`` (~3e-8 fp32, well inside the golden
-    ``weights_after_N`` comparison tolerances).
+    ULP for ``weights`` (~3e-8 fp32, well inside the weight-comparison
+    tolerances of the maintainer's local verification net).
     The optimizer state stays fp32 (AdamW bit-exact, Muon within ULP).
 
     Multi-host : on a v6e-2/4/8 mesh the same sharding spec

@@ -18,7 +18,7 @@ Usage::
     python -m scripts.chat_sft --model-tag d12_jax_seed42 --num-iterations 5 \\
         --device-batch-size 2 --max-seq-len 256 --no-distributed --chatcore-every -1
 
-    # TPU v6e-1 spot 100-step
+    # Short TPU run
     python -m scripts.chat_sft --model-tag d12_jax_seed42 --num-iterations 100 \\
         --device-batch-size 4 --max-seq-len 1024 --bf16
 """
@@ -82,10 +82,10 @@ IDENTITY_CONVERSATIONS_URL = (
 
 
 class DummyWandb:
-    """No-op wandb stub (mirrors upstream's DummyWandb).
+    """No-op logging stub (mirrors upstream's DummyWandb shape).
 
-    Allows `wandb_run.log({...})` and `wandb_run.finish()` to be no-ops when
-    `--run dummy` is specified or wandb dep is not installed.
+    This port does not integrate wandb; `wandb_run.log({...})` and
+    `wandb_run.finish()` are always no-ops.
     """
 
     def log(self, _data: dict) -> None: # noqa: D401
@@ -422,9 +422,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="SFT (Supervised Fine-Tuning) for nanochat-jax"
     )
-    # Logging
-    parser.add_argument("--run", type=str, default="dummy",
-                        help="wandb run name ('dummy' = no-op DummyWandb mirror)")
     # Model loading
     parser.add_argument("--model-tag", type=str, default=None,
                         help="model tag to load from (default: largest in base_checkpoints)")
@@ -493,7 +490,7 @@ def main() -> int:
                         help="Skip jax.distributed.initialize() (CPU dry run)")
     # Compute precision
     parser.add_argument("--bf16", action="store_true", default=False,
-                        help="Use bf16 compute (TPU strict tier; Mac CPU stays fp32 for sanity)")
+                        help="Use bf16 compute (matches the published TPU run; CPU runs stay fp32)")
     # Logging
     parser.add_argument("--log-every", type=int, default=10,
                         help="Log every N steps (master process only).")

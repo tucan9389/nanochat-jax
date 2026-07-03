@@ -445,13 +445,19 @@ def save_checkpoint(
         pt_state_dict = jax_to_pt_state_dict(flat_jax)
 
         model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-        torch.save(pt_state_dict, model_path)
+        # Atomic save: write to .tmp then os.replace, so a preemption mid-write
+        # never exposes a truncated/0-byte file under the final name (a corrupt
+        # optim shard once caused an unattended resume crash-loop). Any GCS
+        # uploader should exclude *.tmp.
+        torch.save(pt_state_dict, model_path + ".tmp")
+        os.replace(model_path + ".tmp", model_path)
         logger.info(f"Saved model parameters to: {model_path}")
 
         if meta_data is not None:
             meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
-            with open(meta_path, "w", encoding="utf-8") as f:
+            with open(meta_path + ".tmp", "w", encoding="utf-8") as f:
                 json.dump(meta_data, f, indent=2)
+            os.replace(meta_path + ".tmp", meta_path)
             logger.info(f"Saved metadata to: {meta_path}")
 
     if optim_state is not None:
@@ -460,7 +466,8 @@ def save_checkpoint(
         optim_path = os.path.join(
             checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt"
         )
-        torch.save(optim_dict, optim_path)
+        torch.save(optim_dict, optim_path + ".tmp")
+        os.replace(optim_path + ".tmp", optim_path)
         logger.info(f"Saved optimizer state to: {optim_path}")
 
 

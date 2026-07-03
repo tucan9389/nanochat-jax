@@ -16,8 +16,9 @@ B_REF_TOKENS = 2**19
 # ``make_config(depth=12)``, n_embd=768) used in the T_epoch weight-decay scaling. Kept
 # as a constant rather than computed live because JAX has no free meta device, so
 # instantiating a d12 model on every run would waste time/HBM (risky next to the d24
-# model). ``test_d12_scaling_params_constant_matches_live_config`` proves this equals a
-# live ``make_config(depth=12)`` count, so it cannot silently drift.
+# model). A regression test in the maintainer's local
+# verification net asserts this equals a live ``make_config(depth=12)`` count, so
+# it cannot silently drift.
 D12_SCALING_PARAMS = 110_100_912
 
 
