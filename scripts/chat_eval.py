@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from functools import partial
 from typing import Any
 
@@ -73,6 +74,8 @@ def run_generative_eval(
     top_k: int,
     max_problems: int | None = None,
     start_index: int = 0,
+    jit_cache_len: int | None = None,
+    gen_log_path: str | None = None,
 ):
     """Sample completions and evaluate via ``task_object.evaluate``.
 
@@ -88,6 +91,11 @@ def run_generative_eval(
         else min(len(task_object), start_index + max_problems)
     )
 
+    if gen_log_path and process_count > 1:
+        # one log per rank: concurrent appends from several processes interleave
+        gen_log_path = f"{gen_log_path}.rank{process_idx}"
+    gen_log = open(gen_log_path, "a", encoding="utf-8") if gen_log_path else None
+
     num_passed, total = 0, 0
     for i in range(start_index + process_idx, stop_index, process_count):
         conversation = task_object[i]
@@ -95,6 +103,16 @@ def run_generative_eval(
         # Tokenize the prompt
         encoded_prompt = tokenizer.render_for_completion(conversation)
 
+        # A fixed cache length keeps the jitted decode forward on a single
+        # compiled executable across problems. Fall back to the per-problem
+        # cache for the (rare) prompt too long for the fixed cache.
+        cache_length_hint = None
+        if jit_cache_len is not None and (
+            len(encoded_prompt) + max_new_tokens <= jit_cache_len
+        ):
+            cache_length_hint = jit_cache_len
+
+        t_start = time.perf_counter()
         # Get the completions
         results, _ = engine.generate_batch(
             encoded_prompt,
@@ -102,7 +120,9 @@ def run_generative_eval(
             max_tokens=max_new_tokens,
             temperature=temperature,
             top_k=top_k,
+            cache_length_hint=cache_length_hint,
         )
+        gen_seconds = time.perf_counter() - t_start
 
         # Decode the completions as text
         prefix_length = len(encoded_prompt)
@@ -116,6 +136,27 @@ def run_generative_eval(
         total += 1
         num_passed += int(passed)
 
+        # Per-problem durability: one JSON line per problem (append + flush)
+        # so a preempted run loses at most the in-flight problem, and grading
+        # can be re-run offline from the saved completions.
+        if gen_log is not None:
+            gen_log.write(
+                json.dumps(
+                    {
+                        "task": type(task_object).__name__,
+                        "index": i,
+                        "passed": bool(passed),
+                        "prompt_tokens": prefix_length,
+                        "gen_tokens": len(results[0]) - prefix_length,
+                        "sec": round(gen_seconds, 3),
+                        "completion": completions[0],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            gen_log.flush()
+
         # Logging (overwrite the same line in the console)
         print(
             f"\r\033[KRank {process_idx} | {num_passed}/{total} ({100 * num_passed / total:.2f}%)",
@@ -125,6 +166,9 @@ def run_generative_eval(
 
     # Newline before final summary
     print()
+
+    if gen_log is not None:
+        gen_log.close()
 
     # Aggregate results across all processes
     num_passed = _all_reduce_sum(num_passed)
@@ -291,6 +335,8 @@ def run_chat_eval(
     top_k: int = 50,
     max_problems: int | None = None,
     start_index: int = 0,
+    jit_cache_len: int | None = None,
+    gen_log_path: str | None = None,
 ):
     """Build the task object and dispatch to the right eval loop."""
     task_module = _build_task_module(task_name)
@@ -306,6 +352,8 @@ def run_chat_eval(
             top_k,
             max_problems=max_problems,
             start_index=start_index,
+            jit_cache_len=jit_cache_len,
+            gen_log_path=gen_log_path,
         )
     elif task_object.eval_type == "categorical":
         acc = run_categorical_eval(
@@ -435,6 +483,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional JSON output path for task accuracies and ChatCORE.",
     )
+    parser.add_argument(
+        "--jit-gen",
+        type=int,
+        default=0,
+        help="Jit the generative decode forward (0=eager, 1=jit; prefill stays eager, decode compiles once)",
+    )
+    parser.add_argument(
+        "--gen-log",
+        type=str,
+        default=None,
+        help="Optional JSONL path; appends one line per generative problem (completion + timing) for offline re-grading",
+    )
     return parser
 
 
@@ -510,7 +570,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     if prepare_model_for_chat_eval(model):
         _print0("Using XLA attention for ChatEval variable-length prompts")
-    engine = Engine(model, tokenizer)
+    engine = Engine(model, tokenizer, jit_forward=bool(args.jit_gen))
+    jit_cache_len = int(model.config.sequence_len) if args.jit_gen else None
+    if args.jit_gen:
+        _print0(
+            f"Jitted decode forward enabled (fixed KV cache length {jit_cache_len})"
+        )
 
     # Determine the tasks to evaluate
     task_names = ALL_TASKS if args.task_name is None else args.task_name.split("|")
@@ -532,6 +597,8 @@ def main(argv: list[str] | None = None) -> int:
             top_k=args.top_k,
             max_problems=args.max_problems,
             start_index=args.start_index,
+            jit_cache_len=jit_cache_len,
+            gen_log_path=args.gen_log,
         )
         results[task_name] = acc
         _print0(f"{task_name} accuracy: {100 * acc:.2f}%")

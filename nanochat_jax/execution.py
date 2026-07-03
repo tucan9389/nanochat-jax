@@ -322,10 +322,15 @@ def execute_code(
         'hello world\\n'
     """
 
-    manager = multiprocessing.Manager()
+    # NOTE: use the spawn start method, not the Linux default fork. The caller
+    # may hold an initialized multithreaded JAX/TPU runtime, and forking it
+    # deadlocks non-deterministically (os.fork RuntimeWarning; observed as a
+    # 35-minute HumanEval hang on TPU).
+    mp_ctx = multiprocessing.get_context("spawn")
+    manager = mp_ctx.Manager()
     result_dict = manager.dict()
 
-    p = multiprocessing.Process(
+    p = mp_ctx.Process(
         target=_unsafe_execute,
         args=(code, timeout, maximum_memory_bytes, result_dict),
     )

@@ -287,9 +287,25 @@ class Engine:
     yields token columns for streaming consumers.
     """
 
-    def __init__(self, model, tokenizer):
+    def __init__(self, model, tokenizer, *, jit_forward: bool = False):
         self.model = model
         self.tokenizer = tokenizer
+        if jit_forward:
+            self._forward = self._make_jit_forward()
+        else:
+            self._forward = self._forward_eager
+
+    @staticmethod
+    def _forward_eager(model, kv_cache: KVCache, ids: jax.Array) -> jax.Array:
+        return model(ids, kv_cache=kv_cache)
+
+    @staticmethod
+    def _make_jit_forward():
+        @nnx.jit
+        def _forward(model, kv_cache: KVCache, ids: jax.Array) -> jax.Array:
+            return model(ids, kv_cache=kv_cache)
+
+        return _forward
 
     def generate(
         self,
@@ -299,6 +315,7 @@ class Engine:
         temperature: float = 1.0,
         top_k: int | None = None,
         seed: int = 42,
+        cache_length_hint: int | None = None,
     ) -> Iterator[tuple[list[int], list[int]]]:
         """Streaming generation.
 
@@ -312,6 +329,16 @@ class Engine:
 
         cfg = self.model.config
         dtype = cfg.compute_dtype
+        if cache_length_hint is not None:
+            if cache_length_hint < len(tokens):
+                raise ValueError(
+                    f"cache_length_hint={cache_length_hint} is shorter than prompt length {len(tokens)}"
+                )
+            if max_tokens is not None and cache_length_hint < len(tokens) + max_tokens:
+                raise ValueError(
+                    f"cache_length_hint={cache_length_hint} is shorter than prompt+max_tokens "
+                    f"{len(tokens) + max_tokens}"
+                )
 
         key = jax.random.PRNGKey(seed)
 
@@ -330,15 +357,19 @@ class Engine:
             "num_layers": cfg.n_layer,
             "n_embd": cfg.n_embd,
         }
+        prefill_cache_len = cache_length_hint if cache_length_hint is not None else len(tokens)
         kv_cache_prefill = KVCache(
             batch_size=1,
-            seq_len=len(tokens),
+            seq_len=prefill_cache_len,
             dtype=dtype,
             **kv_model_kwargs,
         )
         ids_prefill = jnp.array([tokens], dtype=jnp.int32)
-        logits_prefill = self.model(
-            ids_prefill, kv_cache=kv_cache_prefill
+        # NOTE: prefill runs eager — prompt lengths vary, so a jitted prefill
+        # would recompile per length. Only the fixed-shape (B, 1) decode below
+        # is jitted; with a fixed cache_length_hint it compiles once.
+        logits_prefill = self._forward_eager(
+            self.model, kv_cache_prefill, ids_prefill
         )
         logits = jnp.broadcast_to(
             logits_prefill[:, -1, :], (num_samples, logits_prefill.shape[-1])
@@ -346,7 +377,8 @@ class Engine:
 
         # 2) Replicate KV cache for each sample.
         kv_length_hint = (
-            (len(tokens) + max_tokens) if max_tokens is not None
+            cache_length_hint if cache_length_hint is not None
+            else (len(tokens) + max_tokens) if max_tokens is not None
             else cfg.sequence_len
         )
         kv_cache_decode = KVCache(
@@ -410,11 +442,15 @@ class Engine:
 
             yield token_column, token_masks
             num_generated += 1
+            # re-check termination here so the last yielded token does not pay
+            # for one more (discarded) decode forward
+            if max_tokens is not None and num_generated >= max_tokens:
+                break
+            if all(state.completed for state in row_states):
+                break
 
             ids_step = jnp.array(token_column, dtype=jnp.int32)[:, None]
-            logits = self.model(
-                ids_step, kv_cache=kv_cache_decode
-            )[:, -1, :]
+            logits = self._forward(self.model, kv_cache_decode, ids_step)[:, -1, :]
 
     def generate_batch(
         self,

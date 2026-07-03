@@ -646,15 +646,31 @@ class GPT(nnx.Module):
         else:
             assert T >= 1, "decode/prefill requires T >= 1"
 
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        assert T0 + T <= self.cos.shape[1], (
-            f"position {T0 + T} exceeds rotary cache {self.cos.shape[1]}"
-        )
-
-        cos_sin = (
-            self.cos[:, T0:T0 + T].astype(cfg.compute_dtype),
-            self.sin[:, T0:T0 + T].astype(cfg.compute_dtype),
-        )
+        if kv_cache is None:
+            assert T <= self.cos.shape[1], (
+                f"position {T} exceeds rotary cache {self.cos.shape[1]}"
+            )
+            cos_sin = (
+                self.cos[:, :T].astype(cfg.compute_dtype),
+                self.sin[:, :T].astype(cfg.compute_dtype),
+            )
+        else:
+            # NOTE: read the cache position as a traced array and slice with
+            # dynamic_slice_in_dim so the cached decode/prefill forward stays
+            # traceable under jit (int(get_pos()) would force a host sync).
+            assert kv_cache.max_seq_len <= self.cos.shape[1], (
+                f"KV cache length {kv_cache.max_seq_len} exceeds rotary cache "
+                f"{self.cos.shape[1]}"
+            )
+            cache_pos = kv_cache.cache_seqlen[...]
+            cos_sin = (
+                jax.lax.dynamic_slice_in_dim(
+                    self.cos, cache_pos, T, axis=1
+                ).astype(cfg.compute_dtype),
+                jax.lax.dynamic_slice_in_dim(
+                    self.sin, cache_pos, T, axis=1
+                ).astype(cfg.compute_dtype),
+            )
 
         x = self.transformer.wte(idx).astype(cfg.compute_dtype)
         x = rms_norm(x)
@@ -666,10 +682,10 @@ class GPT(nnx.Module):
                 )
                 x = jnp.concatenate([x[:, :1], x[:, 1:] + gate * x[:, :-1]], axis=1)
         else:
-            x_pre_smear_present = bool(kv_cache.has_prev[...])
-            x_pre_smear = (
-                kv_cache.prev_embedding[...] if x_pre_smear_present else None
-            )
+            # NOTE: keep the prev-embedding reads traced (no bool() host sync);
+            # the empty-cache first step is handled by jnp.where below.
+            x_pre_smear = kv_cache.prev_embedding[...]
+            x_pre_smear_present = kv_cache.has_prev[...]
             kv_cache.prev_embedding[...] = x[:, -1:, :]
             kv_cache.has_prev[...] = jnp.array(True)
 
@@ -681,12 +697,14 @@ class GPT(nnx.Module):
                     x = jnp.concatenate(
                         [x[:, :1], x[:, 1:] + gate * x[:, :-1]], axis=1
                     )
-                elif x_pre_smear is not None:
+                else:
                     gate = self.smear_lambda[...].astype(x.dtype) * jax.nn.sigmoid(
                         self.smear_gate(x[:, :, :24])
                     )
-                    x = x + gate * x_pre_smear
-                # else: T=1 first step after empty cache (no prev) -- skip smear.
+                    smear = gate * x_pre_smear
+                    x = x + jnp.where(
+                        x_pre_smear_present, smear, jnp.zeros_like(smear)
+                    )
 
         x0 = x
 
