@@ -34,10 +34,10 @@ Default production stages:
 7. SFT ChatEval
 8. `python -m nanochat_jax.report generate`
 
-SFT ChatEval scores the validated categorical task set (`ARC-Easy|ARC-Challenge|MMLU`). The generative tasks (GSM8K, HumanEval, SpellingBee) are not part of the pipeline: the current JAX generative eval path is too slow to complete them at full scale (see `dev/LEADERBOARD.md`). To score another task manually, run the eval script directly against the SFT checkpoint, e.g.:
+The speedrun's SFT ChatEval scores the categorical task set (`ARC-Easy|ARC-Challenge|MMLU`) for a fast default signal. The generative tasks (GSM8K, HumanEval, SpellingBee) are scored separately with the jitted decode path (`--jit-gen 1`); their full-scale scores and the combined ChatCORE are in `dev/LEADERBOARD.md`. To score a task manually against the SFT checkpoint, e.g.:
 
 ```bash
-python -m scripts.chat_eval -i sft -g d24_speedrun_sft --task-name "GSM8K"
+python -m scripts.chat_eval -i sft -g d24_speedrun_sft --task-name "GSM8K" --jit-gen 1
 ```
 
 The recipe itself (model geometry, batch/horizon, vocab size, task set) is hardcoded in the script, like upstream nanochat's speedrun. (The script trains the default `dc54a1a` recipe; `scripts/base_train.py --recipe 324e69c` selects the upstream Run-4 recipe instead — see `nanochat_jax/recipes.py` for every axis.) A few operational knobs are env-overridable:
@@ -50,7 +50,6 @@ The recipe itself (model geometry, batch/horizon, vocab size, task set) is hardc
 | `NUM_ITERATIONS` | `16704` | Base-train horizon of the published run |
 | `NANOCHAT_JAX_BASE_DIR` | `~/.cache/nanochat-jax` | Root for checkpoints / tokenizer / results |
 | `RESULTS_DIR` | `$NANOCHAT_JAX_BASE_DIR/results/$MODEL_TAG` | JSON artifacts |
-| `WANDB_RUN` | `dummy` | wandb run name for the SFT stage |
 | `PYTHON_BIN` | `python` | Interpreter used for every stage |
 
 Cost basis for the published results is the 2026-06-04 `us-central1` v6e-8 spot price snapshot: `$4.321096/hr`. Spot pricing and capacity change; recheck before budgeting.
@@ -62,7 +61,7 @@ Operating notes:
 - On TPU VMs, preinstall CPU-only torch before `pip install -e ".[tpu,dev]"` to avoid pulling CUDA wheels onto the boot disk: `pip install "torch~=2.11.0" --index-url https://download.pytorch.org/whl/cpu`.
 - `speedrun.sh` writes the base checkpoint under `base_checkpoints/$MODEL_TAG` and the SFT checkpoint under `chatsft_checkpoints/$SFT_MODEL_TAG`.
 - Base CORE uses `--max-per-task -1` by default in production.
-- During SFT, the periodic in-loop ChatCORE (`--chatcore-every 200`) also samples the generative tasks (GSM8K/HumanEval/SpellingBee, 24 problems each); d24 generative decode is slow (minutes per problem), so those eval pauses — not the training steps — dominate the SFT stage's wall-clock. The measured end-to-end cost in `dev/LEADERBOARD.md` already includes them.
+- During SFT, the periodic in-loop ChatCORE (`--chatcore-every 200`) also samples the generative tasks (GSM8K/HumanEval/SpellingBee, 24 problems each); it runs the eager decode path (minutes per problem for d24 — the standalone `--jit-gen 1` path is far faster), so those eval pauses — not the training steps — dominate the SFT stage's wall-clock. The measured end-to-end cost in `dev/LEADERBOARD.md` already includes them.
 - `report.md` is generated both under `$NANOCHAT_JAX_BASE_DIR/report/` and in the repo root for convenience (the repo-root copy is git-ignored, not shipped).
 - Copy expensive checkpoints to GCS before deleting a TPU VM.
 - Delete the TPU VM when you are done. If you tried creating TPUs in more than one zone, list each of those zones afterwards to catch leftover VMs — an orphaned TPU keeps billing.

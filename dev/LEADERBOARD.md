@@ -71,19 +71,24 @@ The shipped pipeline was last re-verified end-to-end on real hardware on July 2 
 
 These numbers ride on four small, intentional divergences from upstream nanochat that predate the published runs (decode-window off-by-one, CORE-eval prompt truncation, smear_gate init, SpellingBee SFT templates). "Fixing" any of them changes what this table (or the SFT section below) reproduces; each is documented in `dev/REPRODUCTION-GUARDS.md` and marked with a NOTE comment at its code site.
 
-## Post-SFT categorical ChatEval
+## Post-SFT ChatEval (all six tasks) and ChatCORE
 
 SFT is validated per pipeline release, not per base leaderboard row: base rows can be re-run and appended above without re-running SFT, and this section only changes when a new SFT run completes.
 
-The scores below come from the June 8 2026 pipeline validation run (the TPU-eval column above). Its final base checkpoint (step 16703) was fine-tuned on the full SFT mixture for 973 steps, and the saved SFT checkpoint was evaluated with `scripts.chat_eval` (`bfloat16`, all examples per task):
+All scores below are for the same SFT checkpoint — the June 8 2026 pipeline validation run's base checkpoint (step 16703) fine-tuned on the full SFT mixture for 973 steps — evaluated with `scripts.chat_eval` at `bfloat16`, temperature 0, top-k 50, one sample, 512 max new tokens, all examples per task:
 
-| Task | Accuracy | Correct / Total |
-|---|---:|---:|
-| ARC-Easy | 66.12% | 1571 / 2376 |
-| ARC-Challenge | 50.68% | 594 / 1172 |
-| MMLU | 37.08% | 5207 / 14042 |
+| Task | Accuracy | Correct / Total | Date |
+|---|---:|---:|---|
+| ARC-Easy | 66.12% | 1571 / 2376 | Jun 9 2026 |
+| ARC-Challenge | 50.68% | 594 / 1172 | Jun 9 2026 |
+| MMLU | 37.08% | 5207 / 14042 | Jun 9 2026 |
+| GSM8K | 9.86% | 130 / 1319 | Jul 3 2026 |
+| HumanEval | 13.41% | 22 / 164 | Jul 3 2026 |
+| SpellingBee | 99.22% | 254 / 256 | Jul 3 2026 |
 
-The generative ChatEval tasks (GSM8K, HumanEval, SpellingBee) are not part of this record: the current JAX generative eval path is too slow to complete them within the run budget, which is why the public default ChatEval is the categorical set.
+**ChatCORE (upstream formula: mean of per-task `(acc - baseline) / (1 - baseline)`, baseline 0.25 for the three multiple-choice tasks, 0.0 for the three open-ended tasks) = `0.3794`.**
+
+The generative rows became measurable with `scripts.chat_eval --jit-gen 1`: the decode forward is jitted with a fixed-length KV cache (compiles once per run) while prefill stays eager, which runs about 24x faster than the eager path on v6e-8 (~0.8 s/token eager vs ~0.034 s/token jitted, ~4-7 s/problem). The eager default path is unchanged. Greedy decoding under `bfloat16` can diverge between the eager and jitted forwards on near-tie logits; a problem-level cross-check of the same checkpoint on different hardware with the eager engine (1,094 GSM8K problems) agreed on 97.99% of pass/fail outcomes with an identical pass count, so the scores are protocol-equivalent within the expected bf16 band. Per-problem records were saved as JSONL via `--gen-log` (one line per problem) so the generative scores can be re-graded offline.
 
 Cost calculations use v6e-8 spot as the primary basis. On-demand is listed only as a reference. Price snapshot: 2026-06-04 Google Cloud.
 

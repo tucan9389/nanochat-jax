@@ -52,7 +52,7 @@ pip install -e ".[dev]"
 
 [`runs/speedrun.sh`](runs/speedrun.sh) is the public run script. It trains the row-1 baseline (`--recipe dc54a1a`): `seq_len=2048`, total batch `524288`, Splash Attention, onehot value-embedding gradients, and model-tag checkpoint/eval continuity. It then trains an SFT checkpoint, runs ChatEval on the SFT checkpoint, and writes a report via `python -m nanochat_jax.report generate`.
 
-SFT ChatEval covers the validated categorical tasks: ARC-Easy, ARC-Challenge, and MMLU. The generative tasks (GSM8K, HumanEval, SpellingBee) are not part of the pipeline — the current JAX generative eval path is too slow to complete them at full scale; they can be scored manually with `scripts/chat_eval.py --task-name`. Measured post-SFT scores are recorded in [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md).
+The speedrun's SFT ChatEval scores the categorical tasks (ARC-Easy, ARC-Challenge, MMLU) for a fast, deterministic signal. The generative tasks (GSM8K, HumanEval, SpellingBee) are scored separately with `scripts/chat_eval.py --task-name ... --jit-gen 1`, whose jitted decode path makes full-scale scoring practical. All six task scores and the resulting ChatCORE are recorded in [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md).
 
 On a v6e-8 TPU host:
 
@@ -138,7 +138,7 @@ Done:
 
 - [x] d24 v6e-8 TPU/JAX train result with BPB and CORE artifacts.
 - [x] Public speedrun wiring from tokenizer through base/SFT/ChatEval/report.
-- [x] Full-mixture SFT checkpoint path and post-SFT categorical ChatEval.
+- [x] Full-mixture SFT checkpoint path and post-SFT ChatEval (all six tasks) with ChatCORE.
 - [x] Pallas Splash Attention path.
 - [x] Muon optimizer support.
 
