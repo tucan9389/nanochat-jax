@@ -20,18 +20,41 @@ Upstream reports training time excluding evaluation and logging time.
 
 ## nanochat-jax (JAX + TPU)
 
-This table uses the upstream append style: one row per completed public-result run. It is separate from upstream Time-to-GPT-2 because the hardware, runtime, and eval hosts differ.
+Same metric as upstream — wall-clock (and cost) to train past the GPT-2 CORE bar `0.256525` — measured on a v6e-8 TPU node instead of 8xH100, hence a separate table. One row per completed public-result run; **row 2 is the current best time-to-GPT-2**.
 
 | # | time (h) | val_bpb | CORE | Description | Date | Commit | Contributors |
 |---|---:|---:|---:|---|---|---|---|
 | 0 | 168.0 | -- | 0.2565 | OpenAI GPT-2 1.6B reference | 2019 | -- | OpenAI |
 | 1 | 7.33* | 0.71879 | 0.27409 | d24 baseline on v6e-8 spot TPU, final checkpoint | Jun 3 2026 | 828485b | @tucan9389 |
+| 2 | 5.28** | 0.71655 | 0.25822 | d24, upstream Run 4 recipe (`--recipe 324e69c`), 1M-token batches | Jun 23 2026 | 4d9d88b | @tucan9389 |
 
 `*` Row 1 time is the estimated full 16,704-step train-loop time. Eval and logging are excluded to match the upstream timing convention.
+`**` Row 2 time is the measured steady rate (`2.876s/step` at ~24.5% MFU) times its 6,612 steps, same convention.
 
-CORE means `max_per_task=-1` and 22/22 tasks. BPB and CORE for row 1 were measured with A100 eval workers. Intermediate checkpoints are not separate leaderboard rows. Row 1 trained on a pre-publish branch state; `828485b` is the public commit verified to reproduce its training path (step-100 and step-2000 loss exact match, BPB difference below `1e-5`).
+CORE means `max_per_task=-1` and 22/22 tasks. BPB and CORE for rows 1-2 were measured with A100 eval workers. Intermediate checkpoints are not separate leaderboard rows. Both rows trained on pre-publish branch states; the listed commit is the public commit verified to reproduce the row's training path (row 1: step-100 and step-2000 loss exact match, BPB difference below `1e-5`; row 2: CPU fp32 losses and forward tensors bit-identical to the training code state, and a 30-step real-data v6e-8 rerun wrote a bit-identical checkpoint whose step-250 resume evaluated identically to the original run's step-250 checkpoint).
 
 Row 1 config: `seq_len=2048`, `n_layer=24`, `n_embd=1536`, `n_head=12`, `524288` tokens/step, `16704` total steps, Splash Attention, value embeddings enabled, `ve_grad_impl=onehot`.
+
+Row 2 config: same geometry with the Run 4 recipe axes (every axis is listed in `nanochat_jax/recipes.py`), `1,048,576` tokens/step, `6,612` total steps, bf16 with `lm_head` matmuls at highest precision. The row-2 training command (checkpointing/logging flags omitted; the recipe flag asserts the LR/schedule values below at startup):
+
+```bash
+export LIBTPU_INIT_ARGS=--xla_tpu_scoped_vmem_limit_kib=65536
+python -m scripts.base_train \
+    --recipe=324e69c \
+    --depth=24 --seq-len=2048 --vocab-size=32768 \
+    --target-param-data-ratio=9.5 --total-batch-size=1048576 \
+    --device-batch-size=2 --grad-accum-steps=32 --grad-accum-impl=fused \
+    --warmup-steps=0 --warmdown-ratio=0.5 --final-lr-frac=0.0 \
+    --weight-decay=0.2 --matrix-lr=0.02 --embedding-lr=0.3 \
+    --unembedding-lr=0.004 --scalar-lr=0.5 \
+    --bf16 --cast-embeddings-bf16 --use-real-data \
+    --attn-impl=splash --splash-block-q=512 --splash-block-kv=512 --splash-block-kv-compute=256 \
+    --matmul-precision=default --lm-head-precision=highest --ve-grad-impl=onehot
+```
+
+It matches upstream Run 4 (`0.71854` / `0.2571`) within upstream's own run-to-run band.
+
+Row 2 eval note: this run's checkpoint metadata predates the recipe fields, so evaluation rebuilt the model with the backout scalar active at its untrained `0.2` init (smear is a no-op at zero init). All row 2 numbers use that protocol self-consistently; with backout disabled val_bpb measures `0.00464` lower. Match the metadata-default semantics when re-evaluating.
 
 ## Reproduction reference
 
@@ -72,6 +95,6 @@ Cost calculations use v6e-8 spot as the primary basis. On-demand is listed only 
 
 Recheck [Google Cloud TPU pricing](https://cloud.google.com/tpu/pricing), [GPU pricing](https://cloud.google.com/compute/gpus-pricing), and [Spot VM pricing notes](https://docs.cloud.google.com/compute/docs/instances/spot#pricing) before budgeting.
 
-For row 1, `16704` steps at `1.58s/step` gives `7.33h`. The spot train estimate is about `$31.7`; the on-demand equivalent is about `$158.4`. The June 8 validation run measured the full pipeline end to end — base training through SFT and categorical ChatEval, including all spot preemption restarts — at `17.92` active TPU-hours, about `$77` at the spot price basis, within the `$100` TPU budget.
+For row 1, `16704` steps at `1.58s/step` gives `7.33h` — about `$31.7` spot (`$158.4` on-demand). For row 2, `6612` steps at the measured `2.876s/step` gives `5.28h` — about `$22.8` spot (`$114` on-demand), the current best cost-to-GPT-2 here. The June 8 validation run measured the full pipeline end to end — base training through SFT and categorical ChatEval, including all spot preemption restarts — at `17.92` active TPU-hours, about `$77` at the spot price basis, within the `$100` TPU budget.
 
 Do not treat sampled CORE (`max_per_task=100`) or `seq_len=4096` / `head_dim=256` probes as nanochat-parity rows.

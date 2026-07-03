@@ -11,15 +11,23 @@
 
 > JAX / Flax NNX port of [Andrej Karpathy's nanochat](https://github.com/karpathy/nanochat), optimized for Google Cloud TPU.
 
-**Matched to the upstream d24 recipe:** the d24 model geometry (24 layers / 1536 wide / 12 heads), the 32,768-vocab tokenizer recipe, the 2048-token context, 524,288-token batches, the 16,704-step train horizon, the NVIDIA ClimbMix pretraining data, and the full 22-task CORE eval protocol.
+Like upstream, the number that matters here is **time-to-GPT-2**: the wall-clock time to train past the GPT-2 CORE score of `0.256525`. On a single v6e-8 spot TPU node, training with `--recipe 324e69c` does it in **5.28 hours — about $23** at the June 2026 spot price ([launch command](dev/LEADERBOARD.md)).
 
-**Changed for the TPU stack:** JAX/Flax NNX instead of PyTorch, Pallas Splash Attention kernels, bf16 embedding storage, TPU mesh sharding, and no FP8 path yet. [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md) records the exact run config and reproduction bands.
+## Time-to-GPT-2 on TPU
+
+| # | time (h) | val_bpb | CORE | Description | Date | Commit |
+|---|---:|---:|---:|---|---|---|
+| 0 | 168.0 | -- | 0.2565 | OpenAI GPT-2 1.6B reference | 2019 | -- |
+| 1 | 7.33 | 0.71879 | 0.27409 | d24 baseline (`--recipe dc54a1a`) | Jun 3 2026 | 828485b |
+| 2 | **5.28** | 0.71655 | 0.25822 | d24, upstream Run 4 recipe (`--recipe 324e69c`), 1M-token batches | Jun 23 2026 | 4d9d88b |
+
+Times are train-loop wall-clock on v6e-8, excluding eval and logging (the upstream convention). Configs, launch commands, eval protocol, reproduction verification, and cost basis: [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md).
+
+**Matched to upstream:** the d24 model geometry (24 layers / 1536 wide / 12 heads), the 32,768-vocab tokenizer recipe, the 2048-token context, the upstream batch/horizon recipes, the NVIDIA ClimbMix pretraining data, and the full 22-task CORE eval protocol.
+
+**Changed for the TPU stack:** JAX/Flax NNX instead of PyTorch, Pallas Splash Attention kernels, bf16 embedding storage, TPU mesh sharding, and no FP8 path yet.
 
 **Intentionally preserved divergences:** the port differs from upstream in four known, small places (a decode-window off-by-one, CORE-eval prompt truncation, the smear_gate init, and the SpellingBee SFT templates). They predate the published runs, so "fixing" them would break their reproduction — each is documented in [`dev/REPRODUCTION-GUARDS.md`](dev/REPRODUCTION-GUARDS.md) and marked with a NOTE comment at its code site.
-
-The public run script mirrors the upstream speedrun flow: tokenizer, base training/eval, SFT, ChatEval, and a generated markdown report.
-
-On v6e-8 spot, `nanochat-jax` reached `CORE=0.274` within a $100 TPU budget on the base-model CORE benchmark. The reference path is [`runs/speedrun.sh`](runs/speedrun.sh).
 
 ## Getting started
 
@@ -42,7 +50,7 @@ pip install -e ".[dev]"
 
 ## Reference run
 
-[`runs/speedrun.sh`](runs/speedrun.sh) is the public run script. It uses the d24 TPU train shape used by the current base result: `seq_len=2048`, total batch `524288`, Splash Attention, onehot value-embedding gradients, and model-tag checkpoint/eval continuity. It then trains an SFT checkpoint, runs ChatEval on the SFT checkpoint, and writes a report via `python -m nanochat_jax.report generate`.
+[`runs/speedrun.sh`](runs/speedrun.sh) is the public run script. It trains the row-1 baseline (`--recipe dc54a1a`): `seq_len=2048`, total batch `524288`, Splash Attention, onehot value-embedding gradients, and model-tag checkpoint/eval continuity. It then trains an SFT checkpoint, runs ChatEval on the SFT checkpoint, and writes a report via `python -m nanochat_jax.report generate`.
 
 SFT ChatEval covers the validated categorical tasks: ARC-Easy, ARC-Challenge, and MMLU. The generative tasks (GSM8K, HumanEval, SpellingBee) are not part of the pipeline — the current JAX generative eval path is too slow to complete them at full scale; they can be scored manually with `scripts/chat_eval.py --task-name`. Measured post-SFT scores are recorded in [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md).
 
@@ -59,10 +67,6 @@ bash runs/runcpu.sh
 ```
 
 The smoke path is not quality evidence. It defaults to `~/.cache/nanochat-jax-smoke`, uses a tiny d2 model, and forces CPU unless `JAX_PLATFORMS` is already set.
-
-## Cost note
-
-The v6e-8 spot result fits within the $100 TPU budget. Pricing changes; see [dev/LEADERBOARD.md](dev/LEADERBOARD.md) for the result row, spot price basis, and hardware comparison.
 
 ## Chat with the model
 
@@ -126,7 +130,7 @@ Use `-i base --model-tag d24_speedrun` to inspect the pretrained base checkpoint
 - Use `--dry-run` on `scripts/base_train.py` for cheap preflight checks.
 - Keep the GCS bucket in the same region as the TPU.
 - Copy expensive checkpoints to GCS before deleting the TPU VM.
-- Delete TPU VMs and sweep candidate zones after each session.
+- Delete the TPU VM when you are done. If you tried creating TPUs in more than one zone, list each of those zones afterwards to catch leftover VMs — an orphaned TPU keeps billing.
 
 ## Status
 

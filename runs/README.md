@@ -40,7 +40,7 @@ SFT ChatEval scores the validated categorical task set (`ARC-Easy|ARC-Challenge|
 python -m scripts.chat_eval -i sft -g d24_speedrun_sft --task-name "GSM8K"
 ```
 
-The recipe itself (model geometry, batch/horizon, vocab size, task set) is hardcoded in the script, like upstream nanochat's speedrun. A few operational knobs are env-overridable:
+The recipe itself (model geometry, batch/horizon, vocab size, task set) is hardcoded in the script, like upstream nanochat's speedrun. (The script trains the default `dc54a1a` recipe; `scripts/base_train.py --recipe 324e69c` selects the upstream Run-4 recipe instead — see `nanochat_jax/recipes.py` for every axis.) A few operational knobs are env-overridable:
 
 | Variable | Default | Meaning |
 |---|---:|---|
@@ -53,7 +53,7 @@ The recipe itself (model geometry, batch/horizon, vocab size, task set) is hardc
 | `WANDB_RUN` | `dummy` | wandb run name for the SFT stage |
 | `PYTHON_BIN` | `python` | Interpreter used for every stage |
 
-Cost basis for the current result is the 2026-06-04 `us-central1` v6e-8 spot price snapshot: `$4.321096/hr`. Spot pricing and capacity change; recheck before budgeting.
+Cost basis for the published results is the 2026-06-04 `us-central1` v6e-8 spot price snapshot: `$4.321096/hr`. Spot pricing and capacity change; recheck before budgeting.
 
 Expected reproduction values (TPU-eval CORE and BPB at the final step) and the measured end-to-end cost are listed in [`dev/LEADERBOARD.md`](../dev/LEADERBOARD.md) under "Reproduction reference".
 
@@ -65,4 +65,4 @@ Operating notes:
 - During SFT, the periodic in-loop ChatCORE (`--chatcore-every 200`) also samples the generative tasks (GSM8K/HumanEval/SpellingBee, 24 problems each); d24 generative decode is slow (minutes per problem), so those eval pauses — not the training steps — dominate the SFT stage's wall-clock. The measured end-to-end cost in `dev/LEADERBOARD.md` already includes them.
 - `report.md` is generated both under `$NANOCHAT_JAX_BASE_DIR/report/` and in the repo root for convenience (the repo-root copy is git-ignored, not shipped).
 - Copy expensive checkpoints to GCS before deleting a TPU VM.
-- Delete TPU VMs and sweep candidate zones after each session.
+- Delete the TPU VM when you are done. If you tried creating TPUs in more than one zone, list each of those zones afterwards to catch leftover VMs — an orphaned TPU keeps billing.
