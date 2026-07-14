@@ -9,9 +9,9 @@
 ╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝       ╚════╝ ╚═╝  ╚═╝╚═╝  ╚═╝
 ```
 
-> JAX / Flax NNX port of [Andrej Karpathy's nanochat](https://github.com/karpathy/nanochat), optimized for Google Cloud TPU.
+> JAX / Flax NNX port of [Andrej Karpathy's nanochat](https://github.com/karpathy/nanochat), aiming to match the original on both model quality and performance on TPU.
 
-Like upstream, the number that matters here is **time-to-GPT-2**: the wall-clock time to train past the GPT-2 CORE score of `0.256525`. On a single v6e-8 spot TPU node, training with `--recipe 324e69c` does it in **5.28 hours — about $23** at the June 2026 spot price ([launch command](dev/LEADERBOARD.md)).
+Like upstream, the number that matters here is **time-to-GPT-2**: the wall-clock time to train past the GPT-2 CORE score of `0.256525`. Current results, launch commands, and cost basis live in the table below and in [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md).
 
 ## Time-to-GPT-2 on TPU
 
@@ -50,9 +50,9 @@ pip install -e ".[dev]"
 
 ## Reference run
 
-[`runs/speedrun.sh`](runs/speedrun.sh) is the public run script. It trains the row-1 baseline (`--recipe dc54a1a`): `seq_len=2048`, total batch `524288`, Splash Attention, onehot value-embedding gradients, and model-tag checkpoint/eval continuity. It then trains an SFT checkpoint, runs ChatEval on the SFT checkpoint, and writes a report via `python -m nanochat_jax.report generate`.
+[`runs/speedrun.sh`](runs/speedrun.sh) is the public run script. It trains the upstream Run 4 recipe (`--recipe 324e69c`, leaderboard row 2): `seq_len=2048`, 1M-token total batch, Splash Attention, onehot value-embedding gradients, and model-tag checkpoint/eval continuity. It then trains an SFT checkpoint, runs ChatEval on the SFT checkpoint, and writes a report via `python -m nanochat_jax.report generate`.
 
-The speedrun's SFT ChatEval scores the categorical tasks (ARC-Easy, ARC-Challenge, MMLU) for a fast, deterministic signal. The generative tasks (GSM8K, HumanEval, SpellingBee) are scored separately with `scripts/chat_eval.py --task-name ... --jit-gen 1`, whose jitted decode path makes full-scale scoring practical. All six task scores and the resulting ChatCORE are recorded in [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md).
+The speedrun's ChatEval scores the categorical tasks (ARC-Easy, ARC-Challenge, MMLU) in one batched pass, then the generative tasks (GSM8K, HumanEval, SpellingBee) one at a time on the jitted decode path (`--jit-gen 1`), which makes full-scale scoring practical. All six task scores and the resulting ChatCORE land in the final report; published scores are recorded in [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md).
 
 On a v6e-8 TPU host:
 
@@ -71,11 +71,11 @@ The smoke path is not quality evidence. It defaults to `~/.cache/nanochat-jax-sm
 ## Chat with the model
 
 ```bash
-python -m scripts.chat_cli -i sft --model-tag d24_speedrun_sft                         # interactive
-python -m scripts.chat_cli -i sft --model-tag d24_speedrun_sft --prompt "Hello" -t 0   # single-prompt, greedy
+python -m scripts.chat_cli -i sft --model-tag d24_speedrun_r4_sft                         # interactive
+python -m scripts.chat_cli -i sft --model-tag d24_speedrun_r4_sft --prompt "Hello" -t 0   # single-prompt, greedy
 ```
 
-Use `-i base --model-tag d24_speedrun` to inspect the pretrained base checkpoint directly. Base models have limited instruction following because they have not seen chat-formatted SFT data.
+Use `-i base --model-tag d24_speedrun_r4` to inspect the pretrained base checkpoint directly. Base models have limited instruction following because they have not seen chat-formatted SFT data.
 
 ## File structure
 
