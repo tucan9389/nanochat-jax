@@ -21,10 +21,10 @@ command -v "$PYTHON_BIN" >/dev/null 2>&1 || PYTHON_BIN="python3"
 export NANOCHAT_JAX_BASE_DIR="${NANOCHAT_JAX_BASE_DIR:-$HOME/.cache/nanochat-jax}"
 mkdir -p "$NANOCHAT_JAX_BASE_DIR"
 
-MODEL_TAG="${MODEL_TAG:-d24_speedrun}"
+MODEL_TAG="${MODEL_TAG:-d24_speedrun_r4}"
 SFT_MODEL_TAG="${SFT_MODEL_TAG:-${MODEL_TAG}_sft}"
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-2}"   # per-device batch; lower to 1 if you OOM
-NUM_ITERATIONS="${NUM_ITERATIONS:-16704}"     # d24 training horizon of the published run
+NUM_ITERATIONS="${NUM_ITERATIONS:--1}"        # -1 = derive from --target-param-data-ratio (R4: 6,612 steps)
 RESULTS_DIR="${RESULTS_DIR:-$NANOCHAT_JAX_BASE_DIR/results/$MODEL_TAG}"
 mkdir -p "$RESULTS_DIR"
 
@@ -52,28 +52,39 @@ DATASET_DOWNLOAD_PID=$!
 echo "Waiting for dataset download to complete..."
 wait "$DATASET_DOWNLOAD_PID"
 
-# d24 recipe. Hyperparameters not shown (LRs, schedule, weight decay, aspect/head-dim)
-# are base_train's defaults. Most flags below differ from the defaults or are
-# TPU-specific; a few that match today's defaults (--recipe, --seq-len, --vocab-size,
+# d24, upstream Run 4 recipe (leaderboard row 2). --recipe=324e69c pins the
+# architecture + optimizer internals (nanochat_jax/recipes.py); the LR/schedule
+# flags below are that recipe's pinned envelope, and base_train asserts them at
+# startup, so a forgotten flag fails loudly instead of silently training a
+# mixed recipe. Flags that match today's defaults (--seq-len, --vocab-size,
 # --bf16, --keep-last-checkpoints) are kept explicit on purpose: they pin this
 # run's recipe, so a future default change cannot silently alter it.
 "$PYTHON_BIN" -m scripts.base_train \
-    --recipe=dc54a1a \
+    --recipe=324e69c \
     --depth=24 \
     --seq-len=2048 \
     --vocab-size=32768 \
-    --total-batch-size=524288 \
+    --target-param-data-ratio=9.5 \
+    --total-batch-size=1048576 \
     --device-batch-size="$DEVICE_BATCH_SIZE" \
-    --grad-accum-steps=16 \
+    --grad-accum-steps=32 \
     --grad-accum-impl=fused \
     --num-iterations="$NUM_ITERATIONS" \
+    --warmup-steps=0 \
+    --warmdown-ratio=0.5 \
+    --final-lr-frac=0.0 \
+    --weight-decay=0.2 \
+    --matrix-lr=0.02 \
+    --embedding-lr=0.3 \
+    --unembedding-lr=0.004 \
+    --scalar-lr=0.5 \
     --bf16 --cast-embeddings-bf16 \
     --use-real-data \
     --attn-impl=splash --splash-block-q=512 --splash-block-kv=512 --splash-block-kv-compute=256 \
     --matmul-precision=default \
     --lm-head-precision=highest \
     --ve-grad-impl=onehot \
-    --checkpoint-every=500 \
+    --checkpoint-every=200 \
     --keep-last-checkpoints=2 \
     --model-tag="$MODEL_TAG" \
     --no-final-eval
@@ -105,7 +116,7 @@ wait "$DATASET_DOWNLOAD_PID"
     --sft-scope full \
     --eval-every 200 \
     --eval-steps 4 \
-    --chatcore-every 200 \
+    --chatcore-every -1 \
     --chatcore-max-cat -1 \
     --chatcore-max-sample 24 \
     --load-optimizer 1 \
@@ -113,7 +124,8 @@ wait "$DATASET_DOWNLOAD_PID"
     --bf16
 
 # -----------------------------------------------------------------------------
-# ChatEval  (score the SFT model on the validated categorical task set)
+# ChatEval  (categorical tasks in one batched pass, then generative tasks one
+# at a time on the jitted decode path)
 
 "$PYTHON_BIN" -m scripts.chat_eval \
     -i sft \
@@ -123,6 +135,20 @@ wait "$DATASET_DOWNLOAD_PID"
     --dtype bfloat16 \
     --out "$RESULTS_DIR/chat_eval_sft.json" \
     --task-name "ARC-Easy|ARC-Challenge|MMLU"
+
+for task in SpellingBee HumanEval GSM8K; do
+    "$PYTHON_BIN" -m scripts.chat_eval \
+        -i sft \
+        -g "$SFT_MODEL_TAG" \
+        --task-name "$task" \
+        --max-new-tokens 512 \
+        --dtype bfloat16 \
+        --num-samples 1 \
+        --temperature 0 \
+        --top-k 50 \
+        --jit-gen 1 \
+        --out "$RESULTS_DIR/chat_eval_$(echo "$task" | tr 'A-Z' 'a-z').json"
+done
 
 # -----------------------------------------------------------------------------
 # Final report
